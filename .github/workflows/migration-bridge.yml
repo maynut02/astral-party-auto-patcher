@@ -1,0 +1,412 @@
+name: Migration Bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 기존 저장소에서 새 저장소로 Patcher 업데이트 경로를 이전합니다.
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: migration-bridge
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  LEGACY_REPOSITORY: maynut02/astral-party-korean-patch
+
+jobs:
+  windows:
+    if: inputs.confirm == true
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha256: ${{ steps.executable.outputs.sha256 }}
+      size: ${{ steps.executable.outputs.size }}
+    defaults:
+      run:
+        working-directory: windows-patcher
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ASTRAL_PATCH_INDEX_URL: https://raw.githubusercontent.com/maynut02/astral-party-korean-patch/distribution/release-index.json
+      ASTRAL_PATCHER_INDEX_URL: https://raw.githubusercontent.com/maynut02/astral-party-auto-patcher/distribution/patcher-index.json
+      ASTRAL_PATCHER_RELEASE_BASE_URL: https://github.com/maynut02/astral-party-auto-patcher/releases/download
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Resolve Windows bridge version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $cargo = Get-Content 'Cargo.toml' -Raw
+          $cargoMatch = [regex]::Match(
+            $cargo,
+            '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"'
+          )
+          if (-not $cargoMatch.Success) {
+            throw 'Could not read the Cargo package version.'
+          }
+          $candidates = @([version]$cargoMatch.Groups[1].Value)
+
+          gh release list --repo $env:LEGACY_REPOSITORY --limit 1000 --json tagName --jq '.[].tagName' |
+            ForEach-Object {
+              if ($_ -match '^windows-patcher-v(\d+)\.(\d+)\.(\d+)$') {
+                $candidates += [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+              }
+            }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to read legacy WindowsPatcher releases.'
+          }
+
+          $legacyIndex = gh api `
+            -H 'Accept: application/vnd.github.raw+json' `
+            "repos/$env:LEGACY_REPOSITORY/contents/patcher-index.json?ref=distribution" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $legacyIndex) {
+            $legacyIndexVersion = ($legacyIndex | ConvertFrom-Json).version
+            if ($legacyIndexVersion -match '^\d+\.\d+\.\d+$') {
+              $candidates += [version]$legacyIndexVersion
+            }
+          }
+          $global:LASTEXITCODE = 0
+
+          $current = $candidates | Sort-Object -Descending | Select-Object -First 1
+          $next = [version]::new($current.Major, $current.Minor, $current.Build + 1)
+          $version = $next.ToString(3)
+
+          $cargo = [regex]::Replace(
+            $cargo,
+            '(?ms)(^\[package\].*?^version\s*=\s*)"[^"]+"',
+            "`$1`"$version`"",
+            1
+          )
+          Set-Content -Path 'Cargo.toml' -Value $cargo -Encoding utf8NoBOM -NoNewline
+
+          $lock = Get-Content 'Cargo.lock' -Raw
+          $lock = [regex]::Replace(
+            $lock,
+            '(?ms)(^\[\[package\]\]\r?\nname = "astral-auto-patcher"\r?\nversion = )"[^"]+"',
+            "`$1`"$version`"",
+            1
+          )
+          Set-Content -Path 'Cargo.lock' -Value $lock -Encoding utf8NoBOM -NoNewline
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=windows-patcher-v$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Windows bridge version: $current -> $version"
+
+      - name: Test and build Windows bridge
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo build --locked --release --bin AstralAutoPatcher
+
+      - name: Read Windows bridge metadata
+        id: executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builtExe = Get-Item 'target/release/AstralAutoPatcher.exe'
+          if ($builtExe.Length -le 0) {
+            throw 'AstralAutoPatcher.exe is empty.'
+          }
+          $releaseExe = Join-Path $env:RUNNER_TEMP 'AstralWindowsPatcher.exe'
+          Copy-Item $builtExe.FullName $releaseExe
+          $exe = Get-Item $releaseExe
+          "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "size=$($exe.Length)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: migration-windows
+          path: ${{ steps.executable.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  android:
+    if: inputs.confirm == true
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      version_code: ${{ steps.apk.outputs.version_code }}
+      sha256: ${{ steps.apk.outputs.sha256 }}
+      size: ${{ steps.apk.outputs.size }}
+    defaults:
+      run:
+        working-directory: android-patcher
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.4.1"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Resolve Android bridge version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          project_version="$(
+            sed -nE 's/.*orElse\("([0-9]+\.[0-9]+\.[0-9]+)"\).*/\1/p' app/build.gradle.kts \
+              | head -n 1
+          )"
+          [[ "$project_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          versions="$(
+            gh release list --repo "$LEGACY_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' \
+              | sed -nE 's/^android-patcher-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p'
+          )"
+
+          legacy_index_version="$(
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$LEGACY_REPOSITORY/contents/mobile-patcher-index.json?ref=distribution" \
+              2>/dev/null | jq -r '.version // empty' || true
+          )"
+
+          current="$(
+            printf '%s\n' "$project_version" "$versions" "$legacy_index_version" \
+              | sed '/^$/d' | sort -V | tail -n 1
+          )"
+          IFS='.' read -r major minor patch <<< "$current"
+          version="${major}.${minor}.$((patch + 1))"
+          tag="android-patcher-v${version}"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Android bridge version: $current -> $version"
+
+      - name: Test and build signed Android bridge
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+
+          umask 077
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/astral-android-patcher.keystore"
+          trap 'truncate -s 0 "$ANDROID_KEYSTORE_PATH"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+
+          gradle :app:testDebugUnitTest :app:lintRelease :app:assembleRelease \
+            -PversionName="$VERSION"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs \
+            app/build/outputs/apk/release/app-release.apk
+          cp app/build/outputs/apk/release/app-release.apk AstralAndroidPatcher.apk
+
+      - name: Read Android bridge metadata
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=AstralAndroidPatcher.apk
+          version_code="$(
+            "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" \
+              | sed -nE "s/^package: name='[^']+' versionCode='([0-9]+)'.*/\1/p" \
+              | head -n 1
+          )"
+          [[ "$version_code" =~ ^[0-9]+$ ]]
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$APK" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c '%s' "$APK")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: migration-android
+          path: android-patcher/AstralAndroidPatcher.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    if: inputs.confirm == true
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Refuse repeated bridge migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release list --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -Eq '^(windows|android)-patcher-v'; then
+            echo 'This repository already has Patcher releases; the migration bridge must run only once.' >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: migration-windows
+          path: .work/bridge
+      - uses: actions/download-artifact@v5
+        with:
+          name: migration-android
+          path: .work/bridge
+
+      - name: Verify bridge artifacts
+        shell: bash
+        env:
+          WINDOWS_SHA256: ${{ needs.windows.outputs.sha256 }}
+          WINDOWS_SIZE: ${{ needs.windows.outputs.size }}
+          ANDROID_SHA256: ${{ needs.android.outputs.sha256 }}
+          ANDROID_SIZE: ${{ needs.android.outputs.size }}
+        run: |
+          set -euo pipefail
+          test "$(sha256sum .work/bridge/AstralWindowsPatcher.exe | awk '{print $1}')" = "$WINDOWS_SHA256"
+          test "$(stat -c '%s' .work/bridge/AstralWindowsPatcher.exe)" = "$WINDOWS_SIZE"
+          test "$(sha256sum .work/bridge/AstralAndroidPatcher.apk | awk '{print $1}')" = "$ANDROID_SHA256"
+          test "$(stat -c '%s' .work/bridge/AstralAndroidPatcher.apk)" = "$ANDROID_SIZE"
+
+      - name: Publish bridge releases to new repository
+        shell: bash
+        env:
+          WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          ANDROID_TAG: ${{ needs.android.outputs.tag }}
+          ANDROID_VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            '## 저장소 이전 브리지' '' \
+            '기존 `astral-party-korean-patch`에서 `astral-party-auto-patcher`로 자동 업데이트 경로를 이전하는 브리지 버전입니다.' \
+            > .work/bridge-notes.md
+
+          gh release create "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe \
+            --target "$GITHUB_SHA" --title "WindowsPatcher v${WINDOWS_VERSION}" \
+            --notes-file .work/bridge-notes.md
+          gh release create "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk \
+            --target "$GITHUB_SHA" --title "AndroidPatcher v${ANDROID_VERSION}" \
+            --notes-file .work/bridge-notes.md
+
+      - name: Publish new repository indexes
+        shell: bash
+        env:
+          WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          WINDOWS_SHA256: ${{ needs.windows.outputs.sha256 }}
+          WINDOWS_SIZE: ${{ needs.windows.outputs.size }}
+          ANDROID_TAG: ${{ needs.android.outputs.tag }}
+          ANDROID_VERSION: ${{ needs.android.outputs.version }}
+          ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
+          ANDROID_SHA256: ${{ needs.android.outputs.sha256 }}
+          ANDROID_SIZE: ${{ needs.android.outputs.size }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > .work/patcher-index.json <<JSON
+          {
+            "schemaVersion": 1,
+            "version": "$WINDOWS_VERSION",
+            "downloadUrl": "https://github.com/$GITHUB_REPOSITORY/releases/download/$WINDOWS_TAG/AstralWindowsPatcher.exe",
+            "sha256": "$WINDOWS_SHA256",
+            "size": $WINDOWS_SIZE
+          }
+          JSON
+          cat > .work/mobile-patcher-index.json <<JSON
+          {
+            "version": "$ANDROID_VERSION",
+            "versionCode": $ANDROID_VERSION_CODE,
+            "downloadUrl": "https://github.com/$GITHUB_REPOSITORY/releases/download/$ANDROID_TAG/AstralAndroidPatcher.apk",
+            "sha256": "$ANDROID_SHA256",
+            "size": $ANDROID_SIZE
+          }
+          JSON
+          python tools/distribution/publish_file.py --source .work/patcher-index.json \
+            --path patcher-index.json --message 'chore: initialize WindowsPatcher distribution index'
+          python tools/distribution/publish_file.py --source .work/mobile-patcher-index.json \
+            --path mobile-patcher-index.json --message 'chore: initialize AndroidPatcher distribution index'
+
+      - name: Publish identical bridge releases to legacy repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LEGACY_REPO_TOKEN }}
+          WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          ANDROID_TAG: ${{ needs.android.outputs.tag }}
+          ANDROID_VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh release create "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe \
+            --repo "$LEGACY_REPOSITORY" --title "WindowsPatcher v${WINDOWS_VERSION} (migration bridge)" \
+            --notes '새 astral-party-auto-patcher 저장소로 자동 업데이트 경로를 이전하는 마지막 브리지 릴리즈입니다.'
+          gh release create "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk \
+            --repo "$LEGACY_REPOSITORY" --title "AndroidPatcher v${ANDROID_VERSION} (migration bridge)" \
+            --notes '새 astral-party-auto-patcher 저장소로 자동 업데이트 경로를 이전하는 마지막 브리지 릴리즈입니다.'
+
+      - name: Point legacy indexes to legacy bridge assets
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.LEGACY_REPO_TOKEN }}
+          WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          WINDOWS_SHA256: ${{ needs.windows.outputs.sha256 }}
+          WINDOWS_SIZE: ${{ needs.windows.outputs.size }}
+          ANDROID_TAG: ${{ needs.android.outputs.tag }}
+          ANDROID_VERSION: ${{ needs.android.outputs.version }}
+          ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
+          ANDROID_SHA256: ${{ needs.android.outputs.sha256 }}
+          ANDROID_SIZE: ${{ needs.android.outputs.size }}
+        run: |
+          set -euo pipefail
+          test -n "$GITHUB_TOKEN"
+          cat > .work/legacy-patcher-index.json <<JSON
+          {
+            "schemaVersion": 1,
+            "version": "$WINDOWS_VERSION",
+            "downloadUrl": "https://github.com/$LEGACY_REPOSITORY/releases/download/$WINDOWS_TAG/AstralWindowsPatcher.exe",
+            "sha256": "$WINDOWS_SHA256",
+            "size": $WINDOWS_SIZE
+          }
+          JSON
+          cat > .work/legacy-mobile-patcher-index.json <<JSON
+          {
+            "version": "$ANDROID_VERSION",
+            "versionCode": $ANDROID_VERSION_CODE,
+            "downloadUrl": "https://github.com/$LEGACY_REPOSITORY/releases/download/$ANDROID_TAG/AstralAndroidPatcher.apk",
+            "sha256": "$ANDROID_SHA256",
+            "size": $ANDROID_SIZE
+          }
+          JSON
+          python tools/distribution/publish_file.py --repo "$LEGACY_REPOSITORY" \
+            --source .work/legacy-patcher-index.json --path patcher-index.json \
+            --message 'chore: publish WindowsPatcher migration bridge'
+          python tools/distribution/publish_file.py --repo "$LEGACY_REPOSITORY" \
+            --source .work/legacy-mobile-patcher-index.json --path mobile-patcher-index.json \
+            --message 'chore: publish AndroidPatcher migration bridge'

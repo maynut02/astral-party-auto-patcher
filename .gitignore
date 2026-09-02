@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Rust
+windows-patcher/target/
+
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+android-patcher/AstralAndroidPatcher.apk
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Runtime / IDE
+.work/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
