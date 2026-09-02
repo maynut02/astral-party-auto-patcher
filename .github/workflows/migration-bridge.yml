@@ -309,18 +309,14 @@ jobs:
             '기존 `astral-party-korean-patch`에서 `astral-party-auto-patcher`로 자동 업데이트 경로를 이전하는 브리지 버전입니다.' \
             > .work/bridge-notes.md
 
-          publish_or_verify() {
+          publish_or_restore() {
             local tag="$1" asset="$2" title="$3"
             if gh release view "$tag" >/dev/null 2>&1; then
               tmp="$(mktemp -d)"
               gh release download "$tag" --pattern "$(basename "$asset")" --dir "$tmp"
-              cmp -s "$asset" "$tmp/$(basename "$asset")" || {
-                echo "Existing bridge release asset differs: $tag/$(basename "$asset")" >&2
-                rm -rf "$tmp"
-                exit 1
-              }
+              cp "$tmp/$(basename "$asset")" "$asset"
               rm -rf "$tmp"
-              echo "Reusing existing bridge release: $tag"
+              echo "Using existing bridge release as canonical artifact: $tag"
               return
             fi
             gh release create "$tag" "$asset" \
@@ -328,21 +324,31 @@ jobs:
               --notes-file .work/bridge-notes.md
           }
 
-          publish_or_verify "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe "WindowsPatcher v${WINDOWS_VERSION}"
-          publish_or_verify "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk "AndroidPatcher v${ANDROID_VERSION}"
+          publish_or_restore "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe "WindowsPatcher v${WINDOWS_VERSION}"
+          publish_or_restore "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk "AndroidPatcher v${ANDROID_VERSION}"
+
+      - name: Read canonical bridge metadata
+        id: canonical
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "windows_sha256=$(sha256sum .work/bridge/AstralWindowsPatcher.exe | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "windows_size=$(stat -c '%s' .work/bridge/AstralWindowsPatcher.exe)" >> "$GITHUB_OUTPUT"
+          echo "android_sha256=$(sha256sum .work/bridge/AstralAndroidPatcher.apk | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "android_size=$(stat -c '%s' .work/bridge/AstralAndroidPatcher.apk)" >> "$GITHUB_OUTPUT"
 
       - name: Publish new repository indexes
         shell: bash
         env:
           WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
           WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
-          WINDOWS_SHA256: ${{ needs.windows.outputs.sha256 }}
-          WINDOWS_SIZE: ${{ needs.windows.outputs.size }}
+          WINDOWS_SHA256: ${{ steps.canonical.outputs.windows_sha256 }}
+          WINDOWS_SIZE: ${{ steps.canonical.outputs.windows_size }}
           ANDROID_TAG: ${{ needs.android.outputs.tag }}
           ANDROID_VERSION: ${{ needs.android.outputs.version }}
           ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
-          ANDROID_SHA256: ${{ needs.android.outputs.sha256 }}
-          ANDROID_SIZE: ${{ needs.android.outputs.size }}
+          ANDROID_SHA256: ${{ steps.canonical.outputs.android_sha256 }}
+          ANDROID_SIZE: ${{ steps.canonical.outputs.android_size }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -417,13 +423,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.LEGACY_REPO_TOKEN }}
           WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
           WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
-          WINDOWS_SHA256: ${{ needs.windows.outputs.sha256 }}
-          WINDOWS_SIZE: ${{ needs.windows.outputs.size }}
+          WINDOWS_SHA256: ${{ steps.canonical.outputs.windows_sha256 }}
+          WINDOWS_SIZE: ${{ steps.canonical.outputs.windows_size }}
           ANDROID_TAG: ${{ needs.android.outputs.tag }}
           ANDROID_VERSION: ${{ needs.android.outputs.version }}
           ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
-          ANDROID_SHA256: ${{ needs.android.outputs.sha256 }}
-          ANDROID_SIZE: ${{ needs.android.outputs.size }}
+          ANDROID_SHA256: ${{ steps.canonical.outputs.android_sha256 }}
+          ANDROID_SIZE: ${{ steps.canonical.outputs.android_size }}
         run: |
           set -euo pipefail
           test -n "$GITHUB_TOKEN"
