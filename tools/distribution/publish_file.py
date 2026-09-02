@@ -70,7 +70,7 @@ def _ensure_branch(*, token: str, repo: str, branch: str, base_sha: str) -> None
     )
 
 
-def _current_file_sha(*, token: str, repo: str, branch: str, remote_path: str) -> str | None:
+def _current_file_state(*, token: str, repo: str, branch: str, remote_path: str) -> tuple[str, bytes] | None:
     quoted = urllib.parse.quote(remote_path.strip("/"), safe="/")
     query = urllib.parse.urlencode({"ref": branch})
     status, data = _request(
@@ -83,9 +83,17 @@ def _current_file_sha(*, token: str, repo: str, branch: str, remote_path: str) -
     if not isinstance(data, dict):
         raise GitHubApiError(f"unexpected GitHub Contents response for {remote_path}")
     sha = data.get("sha")
+    content = data.get("content")
+    encoding = data.get("encoding")
     if not isinstance(sha, str) or not sha:
         raise GitHubApiError(f"GitHub Contents response has no SHA for {remote_path}")
-    return sha
+    if encoding != "base64" or not isinstance(content, str):
+        raise GitHubApiError(f"GitHub Contents response has no base64 content for {remote_path}")
+    try:
+        decoded = base64.b64decode(content, validate=False)
+    except ValueError as exc:
+        raise GitHubApiError(f"GitHub Contents response has invalid base64 for {remote_path}") from exc
+    return sha, decoded
 
 
 def publish_file(
@@ -104,12 +112,15 @@ def publish_file(
     quoted = urllib.parse.quote(remote_path.strip("/"), safe="/")
 
     for attempt in range(2):
-        current_sha = _current_file_sha(
+        current = _current_file_state(
             token=token,
             repo=repo,
             branch=branch,
             remote_path=remote_path,
         )
+        if current is not None and current[1] == payload_bytes:
+            return
+        current_sha = current[0] if current is not None else None
         payload: dict[str, object] = {
             "message": message,
             "content": encoded,

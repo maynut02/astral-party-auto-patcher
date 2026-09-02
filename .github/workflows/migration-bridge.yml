@@ -260,13 +260,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Refuse repeated bridge migration
+      - name: Refuse completed bridge migration
         shell: bash
         run: |
           set -euo pipefail
-          if gh release list --limit 1000 --json tagName --jq '.[].tagName' \
-            | grep -Eq '^(windows|android)-patcher-v'; then
-            echo 'This repository already has Patcher releases; the migration bridge must run only once.' >&2
+          if gh api \
+            -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/migration-bridge.json?ref=distribution" \
+            >/dev/null 2>&1; then
+            echo 'The migration bridge is already marked complete.' >&2
             exit 1
           fi
 
@@ -307,12 +309,27 @@ jobs:
             '기존 `astral-party-korean-patch`에서 `astral-party-auto-patcher`로 자동 업데이트 경로를 이전하는 브리지 버전입니다.' \
             > .work/bridge-notes.md
 
-          gh release create "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe \
-            --target "$GITHUB_SHA" --title "WindowsPatcher v${WINDOWS_VERSION}" \
-            --notes-file .work/bridge-notes.md
-          gh release create "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk \
-            --target "$GITHUB_SHA" --title "AndroidPatcher v${ANDROID_VERSION}" \
-            --notes-file .work/bridge-notes.md
+          publish_or_verify() {
+            local tag="$1" asset="$2" title="$3"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              tmp="$(mktemp -d)"
+              gh release download "$tag" --pattern "$(basename "$asset")" --dir "$tmp"
+              cmp -s "$asset" "$tmp/$(basename "$asset")" || {
+                echo "Existing bridge release asset differs: $tag/$(basename "$asset")" >&2
+                rm -rf "$tmp"
+                exit 1
+              }
+              rm -rf "$tmp"
+              echo "Reusing existing bridge release: $tag"
+              return
+            fi
+            gh release create "$tag" "$asset" \
+              --target "$GITHUB_SHA" --title "$title" \
+              --notes-file .work/bridge-notes.md
+          }
+
+          publish_or_verify "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe "WindowsPatcher v${WINDOWS_VERSION}"
+          publish_or_verify "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk "AndroidPatcher v${ANDROID_VERSION}"
 
       - name: Publish new repository indexes
         shell: bash
@@ -363,12 +380,36 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          gh release create "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe \
-            --repo "$LEGACY_REPOSITORY" --title "WindowsPatcher v${WINDOWS_VERSION} (migration bridge)" \
-            --notes '새 astral-party-auto-patcher 저장소로 자동 업데이트 경로를 이전하는 마지막 브리지 릴리즈입니다.'
-          gh release create "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk \
-            --repo "$LEGACY_REPOSITORY" --title "AndroidPatcher v${ANDROID_VERSION} (migration bridge)" \
-            --notes '새 astral-party-auto-patcher 저장소로 자동 업데이트 경로를 이전하는 마지막 브리지 릴리즈입니다.'
+          can_push="$(gh api "repos/$LEGACY_REPOSITORY" --jq '.permissions.push // false')"
+          if [ "$can_push" != true ]; then
+            echo "LEGACY_REPO_TOKEN does not have write access to $LEGACY_REPOSITORY" >&2
+            exit 1
+          fi
+
+          publish_or_verify_legacy() {
+            local tag="$1" asset="$2" title="$3"
+            if gh release view "$tag" --repo "$LEGACY_REPOSITORY" >/dev/null 2>&1; then
+              tmp="$(mktemp -d)"
+              gh release download "$tag" --repo "$LEGACY_REPOSITORY" \
+                --pattern "$(basename "$asset")" --dir "$tmp"
+              cmp -s "$asset" "$tmp/$(basename "$asset")" || {
+                echo "Existing legacy bridge asset differs: $tag/$(basename "$asset")" >&2
+                rm -rf "$tmp"
+                exit 1
+              }
+              rm -rf "$tmp"
+              echo "Reusing existing legacy bridge release: $tag"
+              return
+            fi
+            gh release create "$tag" "$asset" --repo "$LEGACY_REPOSITORY" \
+              --title "$title" \
+              --notes '새 astral-party-auto-patcher 저장소로 자동 업데이트 경로를 이전하는 마지막 브리지 릴리즈입니다.'
+          }
+
+          publish_or_verify_legacy "$WINDOWS_TAG" .work/bridge/AstralWindowsPatcher.exe \
+            "WindowsPatcher v${WINDOWS_VERSION} (migration bridge)"
+          publish_or_verify_legacy "$ANDROID_TAG" .work/bridge/AstralAndroidPatcher.apk \
+            "AndroidPatcher v${ANDROID_VERSION} (migration bridge)"
 
       - name: Point legacy indexes to legacy bridge assets
         shell: bash
@@ -410,3 +451,24 @@ jobs:
           python tools/distribution/publish_file.py --repo "$LEGACY_REPOSITORY" \
             --source .work/legacy-mobile-patcher-index.json --path mobile-patcher-index.json \
             --message 'chore: publish AndroidPatcher migration bridge'
+
+      - name: Mark migration complete
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WINDOWS_TAG: ${{ needs.windows.outputs.tag }}
+          ANDROID_TAG: ${{ needs.android.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > .work/migration-bridge.json <<JSON
+          {
+            "schemaVersion": 1,
+            "legacyRepository": "$LEGACY_REPOSITORY",
+            "windowsTag": "$WINDOWS_TAG",
+            "androidTag": "$ANDROID_TAG",
+            "completedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          python tools/distribution/publish_file.py \
+            --source .work/migration-bridge.json --path migration-bridge.json \
+            --message 'chore: mark migration bridge complete'

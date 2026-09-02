@@ -25,6 +25,7 @@ def test_android_release_owns_mobile_index() -> None:
 def test_original_apk_workflow_never_merges_or_signs_game_apks() -> None:
     workflow = _text("android-game-original.yml")
     parsed = yaml.safe_load(workflow)
+    assert parsed["name"] == "INT_ANDROID APK"
     assert "release" in parsed["jobs"]
     assert "split_apk=true" in workflow
     assert "prepare_original_apks.py" in workflow
