@@ -408,8 +408,11 @@ where
 
                             // 현재 파일이 공식 원본과 다를 때만 rollback snapshot을 별도로 보존한다.
                             // 공식 원본이면 verified backup을 rollback에도 그대로 재사용할 수 있다.
-                            if previous_size != source_size || previous_hash.as_str() != source_sha256.as_str() {
-                                let previous = rollback_path(staging_root, file.target, &file.path)?;
+                            if previous_size != source_size
+                                || previous_hash.as_str() != source_sha256.as_str()
+                            {
+                                let previous =
+                                    rollback_path(staging_root, file.target, &file.path)?;
                                 if let Some(parent) = previous.parent() {
                                     fs::create_dir_all(parent)?;
                                 }
