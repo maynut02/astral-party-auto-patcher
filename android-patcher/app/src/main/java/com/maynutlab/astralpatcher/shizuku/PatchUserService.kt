@@ -20,6 +20,22 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+internal enum class PatchTargetState {
+    READY,
+    MISSING,
+}
+
+internal enum class OriginalBackupAction {
+    REUSE,
+    REPLACE,
+}
+
+internal fun classifyPatchTarget(targetExists: Boolean): PatchTargetState =
+    if (targetExists) PatchTargetState.READY else PatchTargetState.MISSING
+
+internal fun originalBackupAction(backupExists: Boolean, backupMatches: Boolean): OriginalBackupAction =
+    if (backupExists && backupMatches) OriginalBackupAction.REUSE else OriginalBackupAction.REPLACE
+
 @Keep
 class PatchUserService : IPatchService.Stub() {
     private val filesRoot = File("/storage/emulated/0/Android/data/$GAME_PACKAGE/files")
@@ -198,47 +214,14 @@ class PatchUserService : IPatchService.Stub() {
 
         var ready = 0
         var missing = 0
-        var incompatible = 0
-        var patchedWithoutBackup = 0
         for (index in 0 until files.length()) {
             val item = files.getJSONObject(index)
             val relativePath = PatchProtocol.safeRelativePath(item.getString("path"))
-            val sourceSize = requirePositive(item.getLong("sourceSize"), "원본 파일 크기")
-            val sourceSha = requireSha256(item.getString("sourceSha256"))
-            val payloadSize = requirePositive(item.getLong("payloadSize"), "patch 파일 크기")
-            val payloadSha = requireSha256(item.getString("payloadSha256"))
             val target = findExistingBundle(relativePath)
-            if (target == null) {
-                missing += 1
-                continue
-            }
 
-            val actualPath = target.relativeTo(bundleRoot).invariantSeparatorsPath
-            val backup = File(File(backupsRoot, catalogHash), actualPath)
-            val backupExists = backup.isFile
-            val backupMatches = backupExists &&
-                backup.length() == sourceSize &&
-                sha256(backup) == sourceSha
-
-            if (backupExists && !backupMatches) {
-                incompatible += 1
-            } else if (backupMatches) {
-                ready += 1
-            } else {
-                val targetLength = target.length()
-                val targetHash = if (targetLength == sourceSize || targetLength == payloadSize) {
-                    sha256(target)
-                } else {
-                    null
-                }
-                val sourceMatches = targetLength == sourceSize && targetHash == sourceSha
-                val payloadMatches = targetLength == payloadSize && targetHash == payloadSha
-                if (sourceMatches) {
-                    ready += 1
-                } else {
-                    if (payloadMatches) patchedWithoutBackup += 1
-                    incompatible += 1
-                }
+            when (classifyPatchTarget(target != null)) {
+                PatchTargetState.READY -> ready += 1
+                PatchTargetState.MISSING -> missing += 1
             }
         }
 
@@ -247,8 +230,7 @@ class PatchUserService : IPatchService.Stub() {
             .put("total", files.length())
             .put("ready", ready)
             .put("missing", missing)
-            .put("incompatible", incompatible)
-            .put("patchedWithoutBackup", patchedWithoutBackup)
+            .put("incompatible", 0)
             .toString()
     }
 
@@ -290,19 +272,33 @@ class PatchUserService : IPatchService.Stub() {
             val actualPath = target.relativeTo(bundleRoot).invariantSeparatorsPath
 
             val permanentBackup = File(File(backupsRoot, catalogHash), actualPath)
-            if (permanentBackup.isFile) {
-                verifyFile(permanentBackup, expectedSize, expectedSha, "보관된 원본")
-                original.close()
-                appendDiagnostic(safeId, "release_original_reused", "path=$actualPath")
-                return@diagnosticOperation
+            val backupExists = permanentBackup.isFile
+            val backupMatches = backupExists &&
+                permanentBackup.length() == expectedSize &&
+                sha256(permanentBackup) == expectedSha
+            when (originalBackupAction(backupExists, backupMatches)) {
+                OriginalBackupAction.REUSE -> {
+                    original.close()
+                    appendDiagnostic(safeId, "release_original_reused", "path=$actualPath")
+                    return@diagnosticOperation
+                }
+                OriginalBackupAction.REPLACE -> {
+                    if (backupExists) {
+                        appendDiagnostic(safeId, "release_original_repair", "path=$actualPath 손상된 backup 교체")
+                    }
+                }
             }
 
-            verifyFile(target, expectedSize, expectedSha, "게임 원본")
             val staged = File(transaction, "originals/$actualPath")
             receiveVerified(original, staged, expectedSize, expectedSha, safeId)
             copyVerified(staged, permanentBackup, safeId, "release_original_backup")
+            verifyFile(permanentBackup, expectedSize, expectedSha, "보관된 릴리즈 원본")
             staged.delete()
-            appendDiagnostic(safeId, "release_original_stored", "path=$actualPath bytes=$expectedSize")
+            appendDiagnostic(
+                safeId,
+                if (backupExists) "release_original_repaired" else "release_original_stored",
+                "path=$actualPath bytes=$expectedSize",
+            )
         }
     }
 

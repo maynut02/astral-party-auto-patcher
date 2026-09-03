@@ -711,20 +711,13 @@ private class PatchController(private val activity: MainActivity) {
                 manifest = resolvedManifest.takeIf { ready }
                 main.post {
                     state = state.copy(
-                        resourceStatus = when {
-                            ready -> "패치 대상 리소스 ${targetInspection.total}개 확인 완료"
-                            targetInspection.missing > 0 && targetInspection.incompatible > 0 ->
-                                "리소스 ${targetInspection.missing}개 없음 · ${targetInspection.incompatible}개 불일치"
-                            targetInspection.missing > 0 ->
-                                "필요한 게임 리소스 ${targetInspection.missing}개가 없습니다"
-                            else -> "게임 리소스 ${targetInspection.incompatible}개가 현재 패치와 다릅니다"
+                        resourceStatus = if (ready) {
+                            "패치 대상 리소스 ${targetInspection.total}개 확인 완료"
+                        } else {
+                            "필요한 게임 리소스 ${targetInspection.missing}개가 없습니다"
                         },
-                        resourceIndicator = when {
-                            ready -> StatusIndicator.COMPLETED
-                            targetInspection.incompatible > 0 -> StatusIndicator.ERROR
-                            else -> StatusIndicator.PENDING
-                        },
-                        resourceNeedsDownload = !ready,
+                        resourceIndicator = if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
+                        resourceNeedsDownload = targetInspection.missing > 0,
                         releaseStatus = when {
                             !ready -> "${resolved.patchVersion} · 게임 리소스 필요"
                             resolved.patchVersion == catalogIdentity.installedPatchVersion ->
@@ -732,7 +725,6 @@ private class PatchController(private val activity: MainActivity) {
                             else -> "${resolved.patchVersion} 적용 가능"
                         },
                         releaseIndicator = when {
-                            !ready && targetInspection.incompatible > 0 -> StatusIndicator.ERROR
                             !ready -> StatusIndicator.PENDING
                             resolved.patchVersion == catalogIdentity.installedPatchVersion ->
                                 StatusIndicator.COMPLETED
