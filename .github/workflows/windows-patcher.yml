@@ -130,6 +130,8 @@ jobs:
       - name: Verify EXE
         id: executable
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $builtExe = Get-Item 'target/release/AstralAutoPatcher.exe'
@@ -139,6 +141,25 @@ jobs:
           $releaseExe = Join-Path $env:RUNNER_TEMP 'AstralWindowsPatcher.exe'
           Copy-Item $builtExe.FullName $releaseExe
           $exe = Get-Item $releaseExe
+          $versionInfo = $exe.VersionInfo
+          $expectedMetadata = [ordered]@{
+            ProductName = 'Astral Party Windows Patcher'
+            FileDescription = 'Astral Party Korean Patch Manager'
+            CompanyName = 'MayNut'
+            OriginalFilename = 'AstralWindowsPatcher.exe'
+          }
+          foreach ($entry in $expectedMetadata.GetEnumerator()) {
+            $actual = $versionInfo.PSObject.Properties[$entry.Key].Value
+            if ($actual -ne $entry.Value) {
+              throw "Missing or invalid PE metadata $($entry.Key): '$actual'"
+            }
+          }
+          if (-not $versionInfo.FileVersion.StartsWith($env:VERSION)) {
+            throw "PE FileVersion does not match release version: $($versionInfo.FileVersion)"
+          }
+          if (-not $versionInfo.ProductVersion.StartsWith($env:VERSION)) {
+            throw "PE ProductVersion does not match release version: $($versionInfo.ProductVersion)"
+          }
           $sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
           "sha256=$sha256" >> $env:GITHUB_OUTPUT

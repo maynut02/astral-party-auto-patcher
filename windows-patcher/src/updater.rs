@@ -23,6 +23,7 @@ const INDEX_SCHEMA_VERSION: u32 = 1;
 const MAX_INDEX_BYTES: u64 = 64 * 1024;
 const UPDATE_DIR_NAME: &str = "updates";
 const RELEASE_EXE_NAME: &str = "AstralWindowsPatcher.exe";
+const UPDATE_HELPER_NAME: &str = "AstralWindowsPatcherUpdateHelper.exe";
 const APPLY_UPDATE_ARG: &str = "--apply-update";
 const ARG_SEPARATOR: &str = "--";
 
@@ -101,9 +102,27 @@ impl PatcherIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyUpdatePayload {
+    LegacyCurrentExecutable,
+    Staged {
+        version: String,
+        expected_size: u64,
+        expected_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyUpdateRequest {
     pub previous_pid: u32,
+    pub payload: ApplyUpdatePayload,
     pub original_args: Vec<OsString>,
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn parse_apply_update_request(
@@ -117,12 +136,45 @@ pub fn parse_apply_update_request(
         .and_then(|arg| arg.to_str())
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or(UpdateError::InvalidUpdaterArguments)?;
-    if args.get(2).and_then(|arg| arg.to_str()) != Some(ARG_SEPARATOR) {
+    // 기존 릴리즈는 다운로드한 새 EXE를 직접 실행해 이 형식으로 handoff한다.
+    // 한 번 새 updater로 넘어온 뒤에는 아래의 staged 형식을 사용한다.
+    if args.get(2).and_then(|arg| arg.to_str()) == Some(ARG_SEPARATOR) {
+        return Ok(Some(ApplyUpdateRequest {
+            previous_pid,
+            payload: ApplyUpdatePayload::LegacyCurrentExecutable,
+            original_args: args[3..].to_vec(),
+        }));
+    }
+
+    let version = args
+        .get(2)
+        .and_then(|arg| arg.to_str())
+        .filter(|value| Version::parse(value).is_ok())
+        .ok_or(UpdateError::InvalidUpdaterArguments)?
+        .to_owned();
+    let expected_size = args
+        .get(3)
+        .and_then(|arg| arg.to_str())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(UpdateError::InvalidUpdaterArguments)?;
+    let expected_sha256 = args
+        .get(4)
+        .and_then(|arg| arg.to_str())
+        .filter(|value| valid_sha256(value))
+        .ok_or(UpdateError::InvalidUpdaterArguments)?
+        .to_owned();
+    if args.get(5).and_then(|arg| arg.to_str()) != Some(ARG_SEPARATOR) {
         return Err(UpdateError::InvalidUpdaterArguments);
     }
     Ok(Some(ApplyUpdateRequest {
         previous_pid,
-        original_args: args[3..].to_vec(),
+        payload: ApplyUpdatePayload::Staged {
+            version,
+            expected_size,
+            expected_sha256,
+        },
+        original_args: args[6..].to_vec(),
     }))
 }
 
@@ -147,11 +199,17 @@ pub fn check_and_launch_update(
         return Ok(false);
     }
 
-    let helper = download_update(&client, state_root, &index)?;
+    // 새 버전은 실행하지 않고 검증된 staging 파일로 둔다.
+    // updater helper는 현재 실행 중인 기존 바이너리를 복사해서 사용한다.
+    download_update(&client, state_root, &index)?;
+    let helper = prepare_update_helper(state_root)?;
     let mut command = Command::new(&helper);
     command
         .arg(APPLY_UPDATE_ARG)
         .arg(std::process::id().to_string())
+        .arg(&index.version)
+        .arg(index.size.to_string())
+        .arg(&index.sha256)
         .arg(ARG_SEPARATOR)
         .args(original_args);
     command.spawn()?;
@@ -178,6 +236,12 @@ fn fetch_index(client: &Client, index_url: &str) -> Result<PatcherIndex, UpdateE
     Ok(serde_json::from_slice(&raw)?)
 }
 
+fn update_download_path(state_root: &Path, version: &str) -> PathBuf {
+    state_root
+        .join(UPDATE_DIR_NAME)
+        .join(format!("AstralWindowsPatcher-{version}.download"))
+}
+
 fn download_update(
     client: &Client,
     state_root: &Path,
@@ -185,10 +249,8 @@ fn download_update(
 ) -> Result<PathBuf, UpdateError> {
     let update_root = state_root.join(UPDATE_DIR_NAME);
     fs::create_dir_all(&update_root)?;
-    let helper = update_root.join(format!("AstralAutoPatcher-{}.exe", index.version));
-    let temp = update_root.join(format!("AstralAutoPatcher-{}.download", index.version));
-    let _ = fs::remove_file(&temp);
-    let _ = fs::remove_file(&helper);
+    let download = update_download_path(state_root, &index.version);
+    let _ = fs::remove_file(&download);
 
     let mut response = client.get(&index.download_url).send()?.error_for_status()?;
     if response
@@ -201,7 +263,7 @@ fn download_update(
         });
     }
 
-    let mut file = File::create(&temp)?;
+    let mut file = File::create(&download)?;
     let mut hasher = Sha256::new();
     let mut actual_size = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
@@ -214,7 +276,7 @@ fn download_update(
         hasher.update(&buffer[..read]);
         actual_size = actual_size.saturating_add(read as u64);
         if actual_size > index.size {
-            let _ = fs::remove_file(&temp);
+            let _ = fs::remove_file(&download);
             return Err(UpdateError::DownloadSizeMismatch {
                 expected: index.size,
                 actual: actual_size,
@@ -225,7 +287,7 @@ fn download_update(
     drop(file);
 
     if actual_size != index.size {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(&download);
         return Err(UpdateError::DownloadSizeMismatch {
             expected: index.size,
             actual: actual_size,
@@ -233,15 +295,60 @@ fn download_update(
     }
     let actual_hash = format!("{:x}", hasher.finalize());
     if actual_hash != index.sha256 {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(&download);
         return Err(UpdateError::DownloadHashMismatch {
             expected: index.sha256.clone(),
             actual: actual_hash,
         });
     }
 
+    Ok(download)
+}
+
+fn prepare_update_helper(state_root: &Path) -> Result<PathBuf, UpdateError> {
+    let update_root = state_root.join(UPDATE_DIR_NAME);
+    fs::create_dir_all(&update_root)?;
+    let helper = update_root.join(UPDATE_HELPER_NAME);
+    let temp = update_root.join("AstralWindowsPatcherUpdateHelper.tmp");
+    let current = std::env::current_exe()?;
+    let _ = fs::remove_file(&temp);
+    let _ = fs::remove_file(&helper);
+    fs::copy(current, &temp)?;
+    File::options().write(true).open(&temp)?.sync_all()?;
     fs::rename(&temp, &helper)?;
     Ok(helper)
+}
+
+fn verify_update_file(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), UpdateError> {
+    let actual_size = path.metadata()?.len();
+    if actual_size != expected_size {
+        return Err(UpdateError::DownloadSizeMismatch {
+            expected: expected_size,
+            actual: actual_size,
+        });
+    }
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if actual_hash != expected_sha256 {
+        return Err(UpdateError::DownloadHashMismatch {
+            expected: expected_sha256.to_owned(),
+            actual: actual_hash,
+        });
+    }
+    Ok(())
 }
 
 fn cleanup_old_update_files(state_root: &Path) {
@@ -263,15 +370,29 @@ pub fn apply_update_and_restart(
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let current = std::env::current_exe()?;
     fs::create_dir_all(state_root)?;
     let installed = installed_exe_path(state_root);
-    let replacement = state_root.join("AstralAutoPatcher.replace.tmp.exe");
-    let _ = fs::remove_file(&replacement);
-    fs::copy(&current, &replacement)?;
-    File::options().write(true).open(&replacement)?.sync_all()?;
+    let replacement = match &request.payload {
+        ApplyUpdatePayload::LegacyCurrentExecutable => {
+            let current = std::env::current_exe()?;
+            let replacement = state_root.join("AstralWindowsPatcher.legacy-update.tmp.exe");
+            let _ = fs::remove_file(&replacement);
+            fs::copy(current, &replacement)?;
+            File::options().write(true).open(&replacement)?.sync_all()?;
+            replacement
+        }
+        ApplyUpdatePayload::Staged { version, .. } => update_download_path(state_root, version),
+    };
 
     wait_for_previous_process(request.previous_pid);
+    if let ApplyUpdatePayload::Staged {
+        expected_size,
+        expected_sha256,
+        ..
+    } = &request.payload
+    {
+        verify_update_file(&replacement, *expected_size, expected_sha256)?;
+    }
 
     let from = wide_null(replacement.as_os_str());
     let to = wide_null(installed.as_os_str());
@@ -387,15 +508,68 @@ mod tests {
         let args = vec![
             OsString::from(APPLY_UPDATE_ARG),
             OsString::from("1234"),
+            OsString::from("1.2.3"),
+            OsString::from("123"),
+            OsString::from("a".repeat(64)),
             OsString::from(ARG_SEPARATOR),
             OsString::from("astral://install"),
         ];
         let request = parse_apply_update_request(&args).unwrap().unwrap();
         assert_eq!(request.previous_pid, 1234);
         assert_eq!(
+            request.payload,
+            ApplyUpdatePayload::Staged {
+                version: "1.2.3".into(),
+                expected_size: 123,
+                expected_sha256: "a".repeat(64),
+            }
+        );
+        assert_eq!(
             request.original_args,
             vec![OsString::from("astral://install")]
         );
+    }
+
+    #[test]
+    fn accepts_legacy_handoff_from_existing_releases() {
+        let args = vec![
+            OsString::from(APPLY_UPDATE_ARG),
+            OsString::from("1234"),
+            OsString::from(ARG_SEPARATOR),
+            OsString::from("astral://settings"),
+        ];
+        let request = parse_apply_update_request(&args).unwrap().unwrap();
+        assert_eq!(request.previous_pid, 1234);
+        assert_eq!(request.payload, ApplyUpdatePayload::LegacyCurrentExecutable);
+        assert_eq!(
+            request.original_args,
+            vec![OsString::from("astral://settings")]
+        );
+    }
+
+    #[test]
+    fn downloaded_update_is_kept_as_non_executable_staging_file() {
+        let path = update_download_path(Path::new("C:/State"), "1.2.3");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("AstralWindowsPatcher-1.2.3.download")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_internal_update_metadata() {
+        let args = vec![
+            OsString::from(APPLY_UPDATE_ARG),
+            OsString::from("1234"),
+            OsString::from("1.2.3"),
+            OsString::from("0"),
+            OsString::from("not-a-sha256"),
+            OsString::from(ARG_SEPARATOR),
+        ];
+        assert!(matches!(
+            parse_apply_update_request(&args),
+            Err(UpdateError::InvalidUpdaterArguments)
+        ));
     }
 
     #[test]

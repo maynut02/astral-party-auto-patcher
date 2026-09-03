@@ -127,7 +127,9 @@ pub fn run() -> Result<(), CliError> {
         &original_args,
     ) {
         Ok(true) => {
-            logging::info("new WindowsPatcher version downloaded; handing off to updater");
+            logging::info(
+                "verified WindowsPatcher update downloaded; handing off to local updater helper",
+            );
             return Ok(());
         }
         Ok(false) => logging::info("self update check: current version is up to date"),
