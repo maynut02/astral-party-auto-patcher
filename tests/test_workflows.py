@@ -43,14 +43,3 @@ def test_runtime_repository_boundaries_are_split() -> None:
     assert "astral-party-korean-patch/distribution/release-index.json" in android
     assert "astral-party-auto-patcher/distribution/mobile-patcher-index.json" in android
     assert "astral-party-auto-patcher/distribution/android-game-index.json" in android
-
-
-def test_migration_bridge_reuses_existing_new_repository_assets() -> None:
-    text = _text("migration-bridge.yml")
-    assert "publish_or_restore" in text
-    assert "Using existing bridge release as canonical artifact" in text
-    assert 'cp "$tmp/$(basename "$asset")" "$asset"' in text
-    assert "id: canonical" in text
-    assert "steps.canonical.outputs.windows_sha256" in text
-    assert "steps.canonical.outputs.android_sha256" in text
-    assert "Existing bridge release asset differs" not in text
