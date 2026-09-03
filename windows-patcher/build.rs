@@ -127,7 +127,9 @@ fn main() {
         .set("LegalCopyright", "Copyright (c) MayNut")
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)
         .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version);
-    resource.compile().expect("failed to compile Windows resources");
+    resource
+        .compile()
+        .expect("failed to compile Windows resources");
 }
 
 #[cfg(not(windows))]
