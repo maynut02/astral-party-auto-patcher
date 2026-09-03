@@ -20,6 +20,10 @@ pub enum InstallError {
     SizeMismatch(PathBuf, u64, u64),
     #[error("sha256 mismatch for {0}: expected {1}, actual {2}")]
     HashMismatch(PathBuf, String, String),
+    #[error("replace target is missing: {0}")]
+    ReplaceTargetMissing(PathBuf),
+    #[error("create target already exists: {0}")]
+    CreateTargetExists(PathBuf),
     #[error("ownership manifest is incompatible with current patch")]
     OwnershipMismatch,
     #[error("failed to serialize ownership manifest: {0}")]
@@ -224,6 +228,39 @@ fn backup_path(
     Ok(backup_root.join(target.staging_dir()).join(relative))
 }
 
+fn rollback_path(
+    staging_root: &Path,
+    target: InstallTarget,
+    relative: &str,
+) -> Result<PathBuf, InstallError> {
+    validate_relative_path(relative)?;
+    Ok(staging_root
+        .join("rollback")
+        .join(target.staging_dir())
+        .join(relative))
+}
+
+pub fn validate_patch_targets(
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+) -> Result<(), InstallError> {
+    manifest.validate()?;
+    for file in &manifest.files {
+        let destination = target_path(roots, file.target, &file.path)?;
+        match file.operation.as_str() {
+            "replace" if !destination.is_file() => {
+                return Err(InstallError::ReplaceTargetMissing(destination));
+            }
+            "create" if destination.exists() => {
+                return Err(InstallError::CreateTargetExists(destination));
+            }
+            "replace" | "create" => {}
+            _ => unreachable!("manifest validation rejects unsupported operations"),
+        }
+    }
+    Ok(())
+}
+
 fn copy_replace(source: &Path, destination: &Path) -> Result<(), io::Error> {
     copy_replace_with_progress(source, destination, |_, _| {})
 }
@@ -263,7 +300,12 @@ where
     Ok(())
 }
 
-fn rollback_install(roots: &InstallRoots, backup_root: &Path, ownership: &OwnershipManifest) {
+fn rollback_install(
+    roots: &InstallRoots,
+    staging_root: &Path,
+    backup_root: &Path,
+    ownership: &OwnershipManifest,
+) {
     for created in ownership.created_files.iter().rev() {
         if let Ok(path) = target_path(roots, created.target, &created.path) {
             let _ = fs::remove_file(path);
@@ -274,8 +316,18 @@ fn rollback_install(roots: &InstallRoots, backup_root: &Path, ownership: &Owners
             Ok(path) => path,
             Err(_) => continue,
         };
-        let backup = backup_root.join(&modified.backup_path);
-        let _ = copy_replace(&backup, &destination);
+        let previous = match rollback_path(staging_root, modified.target, &modified.path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let restore = if previous.is_file() {
+            previous
+        } else {
+            backup_root.join(&modified.backup_path)
+        };
+        if restore.is_file() {
+            let _ = copy_replace(&restore, &destination);
+        }
     }
 }
 
@@ -307,7 +359,7 @@ pub fn install_patch_with_progress<F>(
 where
     F: FnMut(ApplyProgress),
 {
-    manifest.validate()?;
+    validate_patch_targets(manifest, roots)?;
     let file_count = manifest.files.len();
     let total_size = manifest.files.iter().map(|file| file.size).sum();
     let mut completed_size = 0_u64;
@@ -334,53 +386,74 @@ where
             verify_file(&stage, file.size, &file.sha256)?;
             let destination = target_path(roots, file.target, &file.path)?;
 
-            if destination.exists() {
-                progress(ApplyProgress {
-                    file_index,
-                    file_count,
-                    path: file.path.clone(),
-                    phase: ApplyPhase::BackingUp,
-                    current: completed_size,
-                    total: total_size,
-                });
-                let backup = backup_path(backup_root, file.target, &file.path)?;
-                let original_hash = match (&file.source_sha256, file.source_size) {
-                    (Some(source_sha256), Some(source_size)) => {
-                        verify_file(&destination, source_size, source_sha256)?;
-                        verify_file(&backup, source_size, source_sha256)?;
-                        source_sha256.clone()
-                    }
-                    (None, None) => {
-                        let original_hash = sha256_file(&destination)?;
-                        if let Some(parent) = backup.parent() {
-                            fs::create_dir_all(parent)?;
+            match file.operation.as_str() {
+                "replace" => {
+                    progress(ApplyProgress {
+                        file_index,
+                        file_count,
+                        path: file.path.clone(),
+                        phase: ApplyPhase::BackingUp,
+                        current: completed_size,
+                        total: total_size,
+                    });
+
+                    let previous_size = destination.metadata()?.len();
+                    let previous_hash = sha256_file(&destination)?;
+                    let backup = backup_path(backup_root, file.target, &file.path)?;
+                    let original_hash = match (&file.source_sha256, file.source_size) {
+                        (Some(source_sha256), Some(source_size)) => {
+                            // 현재 게임 파일은 다른 패치/수정본이어도 허용한다.
+                            // 공식 원본 backup 자체만 Release metadata와 일치하는지 확인한다.
+                            verify_file(&backup, source_size, source_sha256)?;
+
+                            // 현재 파일이 공식 원본과 다를 때만 rollback snapshot을 별도로 보존한다.
+                            // 공식 원본이면 verified backup을 rollback에도 그대로 재사용할 수 있다.
+                            if previous_size != source_size || previous_hash.as_str() != source_sha256.as_str() {
+                                let previous = rollback_path(staging_root, file.target, &file.path)?;
+                                if let Some(parent) = previous.parent() {
+                                    fs::create_dir_all(parent)?;
+                                }
+                                fs::copy(&destination, &previous)?;
+                                verify_file(&previous, previous_size, &previous_hash)?;
+                            }
+                            source_sha256.clone()
                         }
-                        fs::copy(&destination, &backup)?;
-                        original_hash
-                    }
-                    _ => {
-                        return Err(InstallError::Protocol(ProtocolError::UnsafePath(
-                            "partial source restore metadata".into(),
-                        )));
-                    }
-                };
-                ownership.modified_files.push(OwnedModifiedFile {
-                    target: file.target,
-                    path: file.path.clone(),
-                    original_sha256: original_hash,
-                    patched_sha256: file.sha256.clone(),
-                    backup_path: backup
-                        .strip_prefix(backup_root)
-                        .expect("backup path is below root")
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                });
-            } else {
-                ownership.created_files.push(OwnedCreatedFile {
-                    target: file.target,
-                    path: file.path.clone(),
-                    installed_sha256: file.sha256.clone(),
-                });
+                        (None, None) => {
+                            // 구형 manifest에는 Release 원본 metadata가 없을 수 있다.
+                            // 이 경우 기존 동작대로 현재 파일 자체를 복원 backup으로 사용한다.
+                            if let Some(parent) = backup.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            fs::copy(&destination, &backup)?;
+                            verify_file(&backup, previous_size, &previous_hash)?;
+                            previous_hash
+                        }
+                        _ => {
+                            return Err(InstallError::Protocol(ProtocolError::UnsafePath(
+                                "partial source restore metadata".into(),
+                            )));
+                        }
+                    };
+                    ownership.modified_files.push(OwnedModifiedFile {
+                        target: file.target,
+                        path: file.path.clone(),
+                        original_sha256: original_hash,
+                        patched_sha256: file.sha256.clone(),
+                        backup_path: backup
+                            .strip_prefix(backup_root)
+                            .expect("backup path is below root")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    });
+                }
+                "create" => {
+                    ownership.created_files.push(OwnedCreatedFile {
+                        target: file.target,
+                        path: file.path.clone(),
+                        installed_sha256: file.sha256.clone(),
+                    });
+                }
+                _ => unreachable!("manifest validation rejects unsupported operations"),
             }
 
             copy_replace_with_progress(&stage, &destination, |current, _| {
@@ -419,7 +492,7 @@ where
     })();
 
     if let Err(error) = result {
-        rollback_install(roots, backup_root, &ownership);
+        rollback_install(roots, staging_root, backup_root, &ownership);
         return Err(error);
     }
 
@@ -645,6 +718,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let staging = temp.path().join("staging");
         let roots = roots(temp.path());
+        fs::create_dir_all(&roots.game_data).unwrap();
+        fs::write(roots.game_data.join("data.unity3d"), b"original").unwrap();
         let backup = temp.path().join("backup");
         let ownership_path = temp.path().join("installed.json");
         let payload = vec![b'x'; 512 * 1024];
@@ -739,14 +814,15 @@ mod tests {
     }
 
     #[test]
-    fn release_restore_backup_requires_matching_game_original() {
+    fn release_restore_backup_allows_modified_game_target() {
         let temp = tempdir().unwrap();
         let staging = temp.path().join("staging");
         let roots = roots(temp.path());
         fs::create_dir_all(&roots.game_data).unwrap();
         let destination = roots.game_data.join("data.unity3d");
         fs::write(&destination, b"modified").unwrap();
-        let backup = temp.path().join("backup/game-data/data.unity3d");
+        let backup_root = temp.path().join("backup");
+        let backup = backup_root.join("game-data/data.unity3d");
         fs::create_dir_all(backup.parent().unwrap()).unwrap();
         fs::write(&backup, b"original").unwrap();
         let ownership_path = temp.path().join("installed.json");
@@ -773,18 +849,133 @@ mod tests {
             source_size: Some(8),
         });
 
+        install_patch(&patch, &staging, &roots, &backup_root, &ownership_path).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"patched");
+
+        let ownership: OwnershipManifest =
+            serde_json::from_slice(&fs::read(&ownership_path).unwrap()).unwrap();
+        let report = remove_patch(&ownership, &roots, &backup_root).unwrap();
+        assert_eq!(report.restored, 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+    }
+
+    #[test]
+    fn operation_contract_rejects_missing_replace_and_existing_create() {
+        let temp = tempdir().unwrap();
+        let roots = roots(temp.path());
+        let replace = manifest(ManifestFile {
+            target: InstallTarget::GameData,
+            path: "missing.bin".into(),
+            operation: "replace".into(),
+            download_url: "https://example.test/replace.gz".into(),
+            download_sha256: "d".repeat(64),
+            download_size: 1,
+            compression: "gzip".into(),
+            sha256: "e".repeat(64),
+            size: 1,
+            source_download_url: None,
+            source_download_sha256: None,
+            source_download_size: None,
+            source_sha256: None,
+            source_size: None,
+        });
+        assert!(matches!(
+            validate_patch_targets(&replace, &roots),
+            Err(InstallError::ReplaceTargetMissing(_))
+        ));
+
+        fs::create_dir_all(&roots.addressables).unwrap();
+        fs::write(roots.addressables.join("existing.bin"), b"x").unwrap();
+        let create = manifest(ManifestFile {
+            target: InstallTarget::Addressables,
+            path: "existing.bin".into(),
+            operation: "create".into(),
+            download_url: "https://example.test/create.gz".into(),
+            download_sha256: "d".repeat(64),
+            download_size: 1,
+            compression: "gzip".into(),
+            sha256: "e".repeat(64),
+            size: 1,
+            source_download_url: None,
+            source_download_sha256: None,
+            source_download_size: None,
+            source_sha256: None,
+            source_size: None,
+        });
+        assert!(matches!(
+            validate_patch_targets(&create, &roots),
+            Err(InstallError::CreateTargetExists(_))
+        ));
+    }
+
+    #[test]
+    fn failed_install_rolls_back_to_pre_patch_modified_state() {
+        let temp = tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let roots = roots(temp.path());
+        fs::create_dir_all(&roots.game_data).unwrap();
+        let first_target = roots.game_data.join("first.bin");
+        let second_target = roots.game_data.join("second.bin");
+        fs::write(&first_target, b"external-modification").unwrap();
+        fs::write(&second_target, b"second-current").unwrap();
+
+        let backup_root = temp.path().join("backup");
+        fs::create_dir_all(backup_root.join("game-data")).unwrap();
+        fs::write(backup_root.join("game-data/first.bin"), b"official-first").unwrap();
+        fs::write(backup_root.join("game-data/second.bin"), b"official-second").unwrap();
+
+        let first_payload = b"patched-first";
+        let second_payload = b"bad-second-stage";
+        fs::create_dir_all(staging.join("game-data")).unwrap();
+        fs::write(staging.join("game-data/first.bin"), first_payload).unwrap();
+        fs::write(staging.join("game-data/second.bin"), second_payload).unwrap();
+
+        let first_original_hash = format!("{:x}", Sha256::digest(b"official-first"));
+        let second_original_hash = format!("{:x}", Sha256::digest(b"official-second"));
+        let mut patch = manifest(ManifestFile {
+            target: InstallTarget::GameData,
+            path: "first.bin".into(),
+            operation: "replace".into(),
+            download_url: "https://example.test/first.gz".into(),
+            download_sha256: "d".repeat(64),
+            download_size: 1,
+            compression: "gzip".into(),
+            sha256: format!("{:x}", Sha256::digest(first_payload)),
+            size: first_payload.len() as u64,
+            source_download_url: Some("https://example.test/first-original.gz".into()),
+            source_download_sha256: Some("e".repeat(64)),
+            source_download_size: Some(1),
+            source_sha256: Some(first_original_hash),
+            source_size: Some(b"official-first".len() as u64),
+        });
+        patch.files.push(ManifestFile {
+            target: InstallTarget::GameData,
+            path: "second.bin".into(),
+            operation: "replace".into(),
+            download_url: "https://example.test/second.gz".into(),
+            download_sha256: "d".repeat(64),
+            download_size: 1,
+            compression: "gzip".into(),
+            sha256: "f".repeat(64),
+            size: second_payload.len() as u64,
+            source_download_url: Some("https://example.test/second-original.gz".into()),
+            source_download_sha256: Some("e".repeat(64)),
+            source_download_size: Some(1),
+            source_sha256: Some(second_original_hash),
+            source_size: Some(b"official-second".len() as u64),
+        });
+
         let error = install_patch(
             &patch,
             &staging,
             &roots,
-            &temp.path().join("backup"),
-            &ownership_path,
+            &backup_root,
+            &temp.path().join("installed.json"),
         )
         .unwrap_err();
         assert!(matches!(error, InstallError::HashMismatch(_, _, _)));
-        assert_eq!(fs::read(&destination).unwrap(), b"modified");
-        assert_eq!(fs::read(&backup).unwrap(), b"original");
-        assert!(!ownership_path.exists());
+        assert_eq!(fs::read(&first_target).unwrap(), b"external-modification");
+        assert_eq!(fs::read(&second_target).unwrap(), b"second-current");
     }
 
     #[test]

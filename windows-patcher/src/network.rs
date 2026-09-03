@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
@@ -13,6 +14,9 @@ use crate::protocol::{
 };
 
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -83,12 +87,21 @@ pub struct ReleaseClient {
 
 impl ReleaseClient {
     pub fn new(user_agent: &str) -> Result<Self, NetworkError> {
-        let client = Client::builder().user_agent(user_agent).build()?;
+        let client = Client::builder()
+            .user_agent(user_agent)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?;
         Ok(Self { client })
     }
 
     fn get_metadata(&self, url: &str) -> Result<Vec<u8>, NetworkError> {
-        let response = self.client.get(url).send()?.error_for_status()?;
+        let response = self
+            .client
+            .get(url)
+            .timeout(METADATA_TIMEOUT)
+            .send()?
+            .error_for_status()?;
         if response
             .content_length()
             .is_some_and(|size| size > MAX_METADATA_BYTES)

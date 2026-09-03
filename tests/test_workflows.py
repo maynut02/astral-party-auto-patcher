@@ -14,6 +14,8 @@ def test_windows_release_reads_patch_index_from_patch_repo() -> None:
     assert "maynut02/astral-party-korean-patch/distribution/release-index.json" in text
     assert "distribution/patcher-index.json" in text
     assert "windows-patcher-v" in text
+    assert "gh release view patcher-index" not in text
+    assert "gh release upload patcher-index" not in text
 
 
 def test_android_release_owns_mobile_index() -> None:

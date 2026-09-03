@@ -8,7 +8,7 @@ use crate::game::{GameInstallation, GameRoute};
 use crate::install::{
     ApplyPhase, ApplyProgress, InstallError, InstallRoots, InstallSummary, OwnershipManifest,
     RemoveIssueSummary, RemoveReport, install_patch_with_progress, installed_patch_change_count,
-    remove_patch,
+    remove_patch, validate_patch_targets,
 };
 use crate::logging;
 use crate::network::{NetworkError, ReleaseClient, StageProgress};
@@ -410,36 +410,16 @@ fn repair_restore_backups(
 fn prepare_release_restore_backups(
     client: &ReleaseClient,
     manifest: &PatchManifest,
-    roots: &InstallRoots,
     state: &RouteStatePaths,
 ) -> Result<(), ServiceError> {
     for file in &manifest.files {
+        if file.operation != "replace" {
+            continue;
+        }
         let (Some(source_sha256), Some(source_size)) = (&file.source_sha256, file.source_size)
         else {
             continue;
         };
-        let destination = match file.target {
-            crate::protocol::InstallTarget::Addressables => roots.addressables.join(&file.path),
-            crate::protocol::InstallTarget::GameData => roots.game_data.join(&file.path),
-        };
-        if !destination.is_file() {
-            continue;
-        }
-
-        let actual_size = destination.metadata()?.len();
-        if actual_size != source_size {
-            return Err(InstallError::SizeMismatch(destination, source_size, actual_size).into());
-        }
-        let actual_sha256 = crate::install::sha256_file(&destination)?;
-        if actual_sha256 != *source_sha256 {
-            return Err(InstallError::HashMismatch(
-                destination,
-                source_sha256.clone(),
-                actual_sha256,
-            )
-            .into());
-        }
-
         let backup = state
             .backup_root
             .join(file.target.staging_dir())
@@ -451,9 +431,10 @@ fn prepare_release_restore_backups(
             continue;
         }
         logging::info(format!(
-            "Steam restore source prepare: path={} source={}",
+            "Steam restore source prepare: path={} source={} action={}",
             file.path,
-            file.source_download_url.as_deref().unwrap_or("missing")
+            file.source_download_url.as_deref().unwrap_or("missing"),
+            if backup.exists() { "repair" } else { "create" },
         ));
         client.download_original_file(file, &backup)?;
     }
@@ -562,8 +543,9 @@ where
         remove_installed_patch(paths, &roots, game.route)?;
     }
 
+    validate_patch_targets(&manifest, &roots)?;
     state.reset_staging()?;
-    prepare_release_restore_backups(&client, &manifest, &roots, &state)?;
+    prepare_release_restore_backups(&client, &manifest, &state)?;
     client.stage_manifest_files_with_progress(
         &manifest,
         &state.staging_root,

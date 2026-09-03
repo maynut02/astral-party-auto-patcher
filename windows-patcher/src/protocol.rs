@@ -160,9 +160,7 @@ impl PatchManifest {
         let mut seen = std::collections::HashSet::new();
         for file in &self.files {
             validate_relative_path(&file.path)?;
-            if !file.download_url.starts_with("https://")
-                && !file.download_url.starts_with("http://")
-            {
+            if !file.download_url.starts_with("https://") {
                 return Err(ProtocolError::InvalidUrl(
                     "file.downloadUrl",
                     file.download_url.clone(),
@@ -206,7 +204,7 @@ impl PatchManifest {
                 &file.source_sha256,
                 file.source_size,
             ) {
-                if !url.starts_with("https://") && !url.starts_with("http://") {
+                if !url.starts_with("https://") {
                     return Err(ProtocolError::InvalidUrl(
                         "file.sourceDownloadUrl",
                         url.clone(),
@@ -264,9 +262,7 @@ impl ReleaseIndex {
             if !valid_sha256(&entry.manifest_sha256) {
                 return Err(ProtocolError::InvalidSha256("release.manifestSha256"));
             }
-            if !entry.manifest_url.starts_with("https://")
-                && !entry.manifest_url.starts_with("http://")
-            {
+            if !entry.manifest_url.starts_with("https://") {
                 return Err(ProtocolError::InvalidUrl(
                     "release.manifestUrl",
                     entry.manifest_url.clone(),
@@ -366,6 +362,41 @@ mod tests {
         let mut bad = manifest();
         bad.files[0].source_download_url = None;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_insecure_http_release_urls() {
+        let mut payload = manifest();
+        payload.files[0].download_url = "http://example.test/files/data.gz".into();
+        assert!(matches!(
+            payload.validate(),
+            Err(ProtocolError::InvalidUrl("file.downloadUrl", _))
+        ));
+
+        let mut source = manifest();
+        source.files[0].source_download_url = Some("http://example.test/files/original.gz".into());
+        assert!(matches!(
+            source.validate(),
+            Err(ProtocolError::InvalidUrl("file.sourceDownloadUrl", _))
+        ));
+
+        let index = ReleaseIndex {
+            schema_version: 1,
+            releases: vec![ReleaseIndexEntry {
+                route: "INT_STEAM".into(),
+                game_version: "3.2.0".into(),
+                revision: "1042".into(),
+                catalog_hash: "b".repeat(32),
+                channel: "release".into(),
+                patch_version: "v1".into(),
+                manifest_url: "http://example.test/manifest.json".into(),
+                manifest_sha256: "d".repeat(64),
+            }],
+        };
+        assert!(matches!(
+            index.validate(),
+            Err(ProtocolError::InvalidUrl("release.manifestUrl", _))
+        ));
     }
 
     #[test]

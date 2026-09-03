@@ -219,14 +219,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Failed to publish patcher-index.json to the distribution branch.'
           }
-
-          $PSNativeCommandUseErrorActionPreference = $false
-          gh release view patcher-index *> $null
-          $legacyIndexExists = $LASTEXITCODE -eq 0
-          if ($legacyIndexExists) {
-            gh release upload patcher-index $indexPath --clobber
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning 'Failed to mirror the legacy patcher-index release.'
-            }
-          }
-          $global:LASTEXITCODE = 0
