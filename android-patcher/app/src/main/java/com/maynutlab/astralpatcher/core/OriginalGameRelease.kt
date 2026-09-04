@@ -33,7 +33,7 @@ object OriginalGameReleaseProtocol {
         require(root.getInt("schemaVersion") == 1) {
             "지원하지 않는 원본 게임 APK index입니다."
         }
-        require(root.getString("packageName") == GAME_PACKAGE) {
+        require(root.getString("packageName") == GameTarget.INT_ANDROID.packageName) {
             "원본 게임 APK packageName이 다릅니다."
         }
         val versionName = root.getString("versionName")

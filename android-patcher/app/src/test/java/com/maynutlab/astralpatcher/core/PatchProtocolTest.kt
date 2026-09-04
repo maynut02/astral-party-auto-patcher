@@ -11,16 +11,40 @@ class PatchProtocolTest {
     @Test
     fun resolvesExactAndroidRelease() {
         val catalog = CatalogIdentity("3.2.0", "b".repeat(32), null)
-        val release = PatchProtocol.resolveRelease(indexJson(), catalog)
+        val release = PatchProtocol.resolveRelease(indexJson(), catalog, "INT_ANDROID")
         assertNotNull(release)
         assertEquals("v3.2.0_r116", release?.patchVersion)
-        assertNull(PatchProtocol.resolveRelease(indexJson(), catalog.copy(catalogHash = "c".repeat(32))))
+        assertNull(PatchProtocol.resolveRelease(indexJson(), catalog.copy(catalogHash = "c".repeat(32)), "INT_ANDROID"))
     }
 
     @Test
-    fun parsesVerifiedAddressablesManifest() {
+    fun resolvesLatestReleaseForSelectedRoute() {
+        val latest = PatchProtocol.latestReleaseForRoute(indexJson(), "INT_ANDROID", "3.2.0")
+        assertNotNull(latest)
+        assertEquals("INT_ANDROID", latest?.route)
+        assertEquals("v3.2.0_r116", latest?.patchVersion)
+        assertNull(PatchProtocol.latestReleaseForRoute(indexJson(), "CN_ANDROID", "3.2.0"))
+    }
+
+    @Test
+    fun resolvesCnAndroidReleaseAndManifest() {
+        val catalog = CatalogIdentity("3.2.0", "b".repeat(32), null)
+        val index = indexJson().replace("INT_ANDROID", "CN_ANDROID")
+        val release = PatchProtocol.resolveRelease(index, catalog, "CN_ANDROID")
+        assertNotNull(release)
+        assertEquals("CN_ANDROID", release?.route)
+
+        val manifest = manifestJson().replace("INT_ANDROID", "CN_ANDROID").toByteArray()
+        val verified = requireNotNull(release).copy(manifestSha256 = sha256(manifest))
+        val parsed = PatchProtocol.parseManifest(manifest, verified, "CN_ANDROID")
+        assertEquals("CN_ANDROID", parsed.route)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsManifestForDifferentSelectedRoute() {
         val manifest = manifestJson().toByteArray()
         val release = ReleaseEntry(
+            route = "INT_ANDROID",
             gameVersion = "3.2.0",
             revision = "116",
             catalogHash = "b".repeat(32),
@@ -28,7 +52,22 @@ class PatchProtocolTest {
             manifestUrl = trustedUrl("INT_ANDROID_manifest.json"),
             manifestSha256 = sha256(manifest),
         )
-        val parsed = PatchProtocol.parseManifest(manifest, release)
+        PatchProtocol.parseManifest(manifest, release, "CN_ANDROID")
+    }
+
+    @Test
+    fun parsesVerifiedAddressablesManifest() {
+        val manifest = manifestJson().toByteArray()
+        val release = ReleaseEntry(
+            route = "INT_ANDROID",
+            gameVersion = "3.2.0",
+            revision = "116",
+            catalogHash = "b".repeat(32),
+            patchVersion = "v3.2.0_r116",
+            manifestUrl = trustedUrl("INT_ANDROID_manifest.json"),
+            manifestSha256 = sha256(manifest),
+        )
+        val parsed = PatchProtocol.parseManifest(manifest, release, "INT_ANDROID")
         assertEquals(1, parsed.files.size)
         assertEquals("bundle/${"d".repeat(32)}/__data", parsed.files.single().relativePath)
         assertEquals("1".repeat(64), parsed.files.single().sourceSha256)
@@ -41,6 +80,7 @@ class PatchProtocolTest {
         PatchProtocol.parseManifest(
             manifest,
             ReleaseEntry(
+                "INT_ANDROID",
                 "3.2.0",
                 "116",
                 "b".repeat(32),
@@ -48,6 +88,7 @@ class PatchProtocolTest {
                 trustedUrl("INT_ANDROID_manifest.json"),
                 sha256(manifest),
             ),
+            "INT_ANDROID",
         )
     }
 
@@ -67,6 +108,7 @@ class PatchProtocolTest {
         val manifest = PatchProtocol.parseManifest(
             bytes,
             ReleaseEntry(
+                "INT_ANDROID",
                 "3.2.0",
                 "116",
                 "b".repeat(32),
@@ -74,6 +116,7 @@ class PatchProtocolTest {
                 trustedUrl("INT_ANDROID_manifest.json"),
                 sha256(bytes),
             ),
+            "INT_ANDROID",
         )
         val request = org.json.JSONObject(PatchProtocol.createTargetInspectionRequest(manifest))
         assertEquals("b".repeat(32), request.getString("catalogHash"))

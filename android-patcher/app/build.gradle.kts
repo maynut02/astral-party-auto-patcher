@@ -22,7 +22,9 @@ fun versionCodeFrom(version: String): Int {
 
 android {
     namespace = "com.maynutlab.astralpatcher"
-    compileSdk = 36
+    compileSdk {
+        version = release(37)
+    }
 
     defaultConfig {
         applicationId = "com.maynutlab.astralpatcher"
@@ -76,12 +78,12 @@ android {
 }
 
 dependencies {
-    // Compose 1.11 is the newest stable line that compiles against API 36.
     val composeBom = platform("androidx.compose:compose-bom:2026.04.01")
     implementation(composeBom)
 
     implementation("androidx.activity:activity-compose:1.13.0")
-    implementation("androidx.compose.material3:material3")
+    // Material 3 Expressive APIs (MaterialExpressiveTheme, MotionScheme, expressive ListItem).
+    implementation("androidx.compose.material3:material3:1.5.0-alpha27")
     implementation("androidx.core:core:1.17.0")
 
     implementation("dev.rikka.shizuku:api:13.1.5")
@@ -89,4 +91,7 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20260814")
+
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
 }

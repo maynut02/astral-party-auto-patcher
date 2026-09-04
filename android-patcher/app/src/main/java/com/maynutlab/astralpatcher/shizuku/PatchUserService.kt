@@ -5,8 +5,9 @@ import android.system.Os
 import android.system.OsConstants
 import androidx.annotation.Keep
 import com.maynutlab.astralpatcher.IPatchService
-import com.maynutlab.astralpatcher.core.GAME_PACKAGE
+import com.maynutlab.astralpatcher.core.GameTarget
 import com.maynutlab.astralpatcher.core.PatchProtocol
+import com.maynutlab.astralpatcher.core.requireSupportedGamePackage
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -23,6 +24,7 @@ import java.util.concurrent.TimeUnit
 internal enum class PatchTargetState {
     READY,
     MISSING,
+    INCOMPATIBLE,
 }
 
 internal enum class OriginalBackupAction {
@@ -30,29 +32,58 @@ internal enum class OriginalBackupAction {
     REPLACE,
 }
 
-internal fun classifyPatchTarget(targetExists: Boolean): PatchTargetState =
-    if (targetExists) PatchTargetState.READY else PatchTargetState.MISSING
+internal fun classifyPatchTarget(
+    targetExists: Boolean,
+    sourceMatches: Boolean,
+    payloadMatches: Boolean,
+): PatchTargetState = when {
+    !targetExists -> PatchTargetState.MISSING
+    sourceMatches || payloadMatches -> PatchTargetState.READY
+    else -> PatchTargetState.INCOMPATIBLE
+}
 
 internal fun originalBackupAction(backupExists: Boolean, backupMatches: Boolean): OriginalBackupAction =
     if (backupExists && backupMatches) OriginalBackupAction.REUSE else OriginalBackupAction.REPLACE
 
 @Keep
 class PatchUserService : IPatchService.Stub() {
-    private val filesRoot = File("/storage/emulated/0/Android/data/$GAME_PACKAGE/files")
-    private val addressablesRoot = File(filesRoot, "com.unity.addressables")
-    private val bundleRoot = File(addressablesRoot, "AssetBundles")
-    private val stateRoot = File(filesRoot, ".astralpatch-manager")
-    private val transactionsRoot = File(stateRoot, "transactions")
-    private val backupsRoot = File(stateRoot, "backups")
-    private val stateFile = File(stateRoot, "state.json")
-    private val diagnosticsFile = File(stateRoot, "patch-diagnostics.jsonl")
+    private data class TargetStorage(
+        val packageName: String,
+        val filesRoot: File,
+        val addressablesRoot: File,
+        val bundleRoot: File,
+        val stateRoot: File,
+        val transactionsRoot: File,
+        val backupsRoot: File,
+        val stateFile: File,
+        val diagnosticsFile: File,
+    )
+
+    private fun storageFor(packageName: String): TargetStorage {
+        val safePackage = requireSupportedGamePackage(packageName)
+        val filesRoot = File("/storage/emulated/0/Android/data/$safePackage/files")
+        val addressablesRoot = File(filesRoot, "com.unity.addressables")
+        val stateRoot = File(filesRoot, ".astralpatch-manager")
+        return TargetStorage(
+            packageName = safePackage,
+            filesRoot = filesRoot,
+            addressablesRoot = addressablesRoot,
+            bundleRoot = File(addressablesRoot, "AssetBundles"),
+            stateRoot = stateRoot,
+            transactionsRoot = File(stateRoot, "transactions"),
+            backupsRoot = File(stateRoot, "backups"),
+            stateFile = File(stateRoot, "state.json"),
+            diagnosticsFile = File(stateRoot, "patch-diagnostics.jsonl"),
+        )
+    }
+
     private val gameInstallRoot = File("/data/local/tmp/astral-original-installer")
     private var activeGameInstallId: String? = null
     private var expectedGameApkCount = 0
     private var gameInstallStatus = "idle"
 
     override fun getServiceInfo(): String =
-        "AstralPatchService/5 uid=${android.os.Process.myUid()} pid=${android.os.Process.myPid()} " +
+        "AstralPatchService/6 uid=${android.os.Process.myUid()} pid=${android.os.Process.myPid()} " +
             "installer=$gameInstallStatus"
 
     @Synchronized
@@ -178,14 +209,14 @@ class PatchUserService : IPatchService.Stub() {
     }
 
     @Synchronized
-    override fun inspectGame(): String {
+    override fun inspectGame(packageName: String): String = with(storageFor(packageName)) {
         require(filesRoot.isDirectory) { "Astral Party의 외부 files 디렉터리를 찾지 못했습니다." }
         require(addressablesRoot.isDirectory) { "게임을 먼저 실행해 리소스를 다운로드해 주세요." }
         require(bundleRoot.isDirectory) { "Addressables bundle cache를 찾지 못했습니다." }
         recoverInterruptedTransactions()
         val catalog = discoverCatalog()
         val state = readState()
-        return JSONObject()
+        JSONObject()
             .put("schemaVersion", 1)
             .put("gameVersion", catalog.first)
             .put("catalogHash", catalog.second)
@@ -199,93 +230,115 @@ class PatchUserService : IPatchService.Stub() {
     }
 
     @Synchronized
-    override fun inspectPatchTargets(requirementsJson: String): String {
-        recoverInterruptedTransactions()
-        require(requirementsJson.toByteArray(Charsets.UTF_8).size <= MAX_INSPECTION_REQUEST_BYTES) {
-            "리소스 검사 요청이 허용 크기를 초과합니다."
-        }
-        val request = JSONObject(requirementsJson)
-        require(request.getInt("schemaVersion") == 1) { "지원하지 않는 리소스 검사 요청입니다." }
-        val catalogHash = requireCatalogHash(request.getString("catalogHash"))
-        require(discoverCatalog().second == catalogHash) { "게임 catalog가 patch manifest와 다릅니다." }
-        require(request.getString("patchVersion").isNotBlank()) { "patch version이 비어 있습니다." }
-        val files = request.getJSONArray("files")
-        require(files.length() in 1..MAX_PATCH_FILES) { "검사할 patch 파일 수가 올바르지 않습니다." }
-
-        var ready = 0
-        var missing = 0
-        for (index in 0 until files.length()) {
-            val item = files.getJSONObject(index)
-            val relativePath = PatchProtocol.safeRelativePath(item.getString("path"))
-            val target = findExistingBundle(relativePath)
-
-            when (classifyPatchTarget(target != null)) {
-                PatchTargetState.READY -> ready += 1
-                PatchTargetState.MISSING -> missing += 1
+    override fun inspectPatchTargets(packageName: String, requirementsJson: String): String =
+        with(storageFor(packageName)) {
+            recoverInterruptedTransactions()
+            require(requirementsJson.toByteArray(Charsets.UTF_8).size <= MAX_INSPECTION_REQUEST_BYTES) {
+                "리소스 검사 요청이 허용 크기를 초과합니다."
             }
-        }
+            val request = JSONObject(requirementsJson)
+            require(request.getInt("schemaVersion") == 1) { "지원하지 않는 리소스 검사 요청입니다." }
+            val catalogHash = requireCatalogHash(request.getString("catalogHash"))
+            require(discoverCatalog().second == catalogHash) { "게임 catalog가 patch manifest와 다릅니다." }
+            require(request.getString("patchVersion").isNotBlank()) { "patch version이 비어 있습니다." }
+            val files = request.getJSONArray("files")
+            require(files.length() in 1..MAX_PATCH_FILES) { "검사할 patch 파일 수가 올바르지 않습니다." }
 
-        return JSONObject()
-            .put("schemaVersion", 1)
-            .put("total", files.length())
-            .put("ready", ready)
-            .put("missing", missing)
-            .put("incompatible", 0)
-            .toString()
-    }
+            var ready = 0
+            var missing = 0
+            var incompatible = 0
+            for (index in 0 until files.length()) {
+                val item = files.getJSONObject(index)
+                val relativePath = PatchProtocol.safeRelativePath(item.getString("path"))
+                val sourceSize = item.getLong("sourceSize")
+                val sourceSha = requireSha256(item.getString("sourceSha256"))
+                val payloadSize = item.getLong("payloadSize")
+                val payloadSha = requireSha256(item.getString("payloadSha256"))
+                require(sourceSize > 0 && payloadSize > 0) { "리소스 크기가 올바르지 않습니다." }
+
+                val target = findExistingBundle(relativePath)
+                val targetSize = target?.length()
+                val targetSha = if (
+                    target != null &&
+                    (targetSize == sourceSize || targetSize == payloadSize)
+                ) {
+                    sha256(target)
+                } else {
+                    null
+                }
+                val state = classifyPatchTarget(
+                    targetExists = target != null,
+                    sourceMatches = targetSize == sourceSize && targetSha == sourceSha,
+                    payloadMatches = targetSize == payloadSize && targetSha == payloadSha,
+                )
+                when (state) {
+                    PatchTargetState.READY -> ready += 1
+                    PatchTargetState.MISSING -> missing += 1
+                    PatchTargetState.INCOMPATIBLE -> incompatible += 1
+                }
+            }
+
+            JSONObject()
+                .put("schemaVersion", 1)
+                .put("total", files.length())
+                .put("ready", ready)
+                .put("missing", missing)
+                .put("incompatible", incompatible)
+                .toString()
+        }
 
     @Synchronized
-    override fun beginPatch(transactionId: String, catalogHash: String) {
-        val safeId = requireTransactionId(transactionId)
-        val expectedHash = requireCatalogHash(catalogHash)
-        resetDiagnostics(safeId, "catalog=$expectedHash")
-        diagnosticOperation(safeId, "begin_patch") {
-            forceStopGame()
-            appendDiagnostic(safeId, "game_stopped", "package=$GAME_PACKAGE")
-            recoverInterruptedTransactions()
-            appendDiagnostic(safeId, "recovery_complete", "이전 transaction 정리 완료")
-            require(discoverCatalog().second == expectedHash) { "게임 catalog가 패치 확인 후 변경되었습니다." }
-            val transaction = transactionRoot(safeId)
-            require(!transaction.exists()) { "같은 patch transaction이 이미 존재합니다." }
-            require(transaction.mkdirs()) { "patch transaction 디렉터리를 만들 수 없습니다." }
-            writeTextAtomic(File(transaction, "catalog.txt"), expectedHash)
-            appendDiagnostic(safeId, "transaction_created", transactionDetail(transaction))
+    override fun beginPatch(transactionId: String, packageName: String, catalogHash: String) =
+        with(storageFor(packageName)) {
+            val safeId = requireTransactionId(transactionId)
+            val expectedHash = requireCatalogHash(catalogHash)
+            resetDiagnostics(safeId, "package=$packageName catalog=$expectedHash")
+            diagnosticOperation(safeId, "begin_patch") {
+                forceStopGame(packageName)
+                appendDiagnostic(safeId, "game_stopped", "package=$packageName")
+                recoverInterruptedTransactions()
+                appendDiagnostic(safeId, "recovery_complete", "이전 transaction 정리 완료")
+                require(discoverCatalog().second == expectedHash) { "게임 catalog가 패치 확인 후 변경되었습니다." }
+                val transaction = transactionRoot(safeId)
+                require(!transaction.exists()) { "같은 patch transaction이 이미 존재합니다." }
+                require(transaction.mkdirs()) { "patch transaction 디렉터리를 만들 수 없습니다." }
+                writeTextAtomic(File(transaction, "catalog.txt"), expectedHash)
+                writeTextAtomic(File(transaction, "package.txt"), packageName)
+                appendDiagnostic(safeId, "transaction_created", transactionDetail(transaction))
+            }
         }
-    }
 
     @Synchronized
     override fun stageOriginal(
         transactionId: String,
+        packageName: String,
         original: ParcelFileDescriptor,
         sourceSize: Long,
         sourceSha256: String,
         relativePath: String,
-    ) {
+    ) = with(storageFor(packageName)) {
         val safeId = requireTransactionId(transactionId)
         diagnosticOperation(safeId, "stage_original", "path=$relativePath sourceSize=$sourceSize") {
             val expectedSize = requirePositive(sourceSize, "원본 파일 크기")
             val expectedSha = requireSha256(sourceSha256)
             val safeRelative = PatchProtocol.safeRelativePath(relativePath)
             val transaction = activeTransaction(safeId)
+            requireTransactionPackage(transaction, packageName)
             val catalogHash = requireCatalogHash(File(transaction, "catalog.txt").readText().trim())
             val target = resolveExistingBundle(safeRelative)
             val actualPath = target.relativeTo(bundleRoot).invariantSeparatorsPath
 
             val permanentBackup = File(File(backupsRoot, catalogHash), actualPath)
             val backupExists = permanentBackup.isFile
-            val backupMatches = backupExists &&
-                permanentBackup.length() == expectedSize &&
-                sha256(permanentBackup) == expectedSha
+            val backupMatches = backupExists && permanentBackup.length() == expectedSize && sha256(permanentBackup) == expectedSha
             when (originalBackupAction(backupExists, backupMatches)) {
                 OriginalBackupAction.REUSE -> {
                     original.close()
                     appendDiagnostic(safeId, "release_original_reused", "path=$actualPath")
                     return@diagnosticOperation
                 }
-                OriginalBackupAction.REPLACE -> {
-                    if (backupExists) {
-                        appendDiagnostic(safeId, "release_original_repair", "path=$actualPath 손상된 backup 교체")
-                    }
+                OriginalBackupAction.REPLACE -> if (backupExists) {
+                    appendDiagnostic(safeId, "release_original_repair", "path=$actualPath 손상된 backup 교체")
                 }
             }
 
@@ -305,16 +358,17 @@ class PatchUserService : IPatchService.Stub() {
     @Synchronized
     override fun applyFile(
         transactionId: String,
+        packageName: String,
         payload: ParcelFileDescriptor,
         size: Long,
         sha256: String,
         sourceSize: Long,
         sourceSha256: String,
         relativePath: String,
-    ): String {
+    ): String = with(storageFor(packageName)) {
         val safeId = requireTransactionId(transactionId)
         val requestedPath = relativePath.take(MAX_DIAGNOSTIC_DETAIL_CHARS)
-        return try {
+        try {
             diagnosticOperation(
                 safeId,
                 "apply_file",
@@ -326,6 +380,7 @@ class PatchUserService : IPatchService.Stub() {
                 val expectedSourceSha = requireSha256(sourceSha256)
                 val safePath = PatchProtocol.safeRelativePath(relativePath)
                 val transaction = activeTransaction(safeId)
+                requireTransactionPackage(transaction, packageName)
                 val catalogHash = File(transaction, "catalog.txt").readText().trim()
                 val target = resolveExistingBundle(safePath)
                 val actualPath = target.relativeTo(bundleRoot).invariantSeparatorsPath
@@ -348,11 +403,7 @@ class PatchUserService : IPatchService.Stub() {
 
                 val staged = File(transaction, "staging/$actualPath")
                 receiveVerified(payload, staged, size, expectedSha, safeId)
-                appendDiagnostic(
-                    safeId,
-                    "payload_verified",
-                    "path=$actualPath bytes=${staged.length()} sha256=$expectedSha",
-                )
+                appendDiagnostic(safeId, "payload_verified", "path=$actualPath bytes=${staged.length()} sha256=$expectedSha")
                 appendJournal(journal, actualPath, safeId)
                 appendDiagnostic(safeId, "journal_written", "path=$actualPath ${journalDetail(journal)}")
                 replaceFile(staged, target, safeId, "patch_target")
@@ -369,27 +420,28 @@ class PatchUserService : IPatchService.Stub() {
     @Synchronized
     override fun commitPatch(
         transactionId: String,
+        packageName: String,
         gameVersion: String,
         catalogHash: String,
         patchVersion: String,
-    ) {
+    ) = with(storageFor(packageName)) {
         val safeId = requireTransactionId(transactionId)
         diagnosticOperation(
             safeId,
             "commit_patch",
-            "gameVersion=$gameVersion patchVersion=$patchVersion catalog=$catalogHash",
+            "package=$packageName gameVersion=$gameVersion patchVersion=$patchVersion catalog=$catalogHash",
         ) {
             require(gameVersion.isNotBlank() && patchVersion.isNotBlank()) { "patch 상태 정보가 비어 있습니다." }
             val expectedHash = requireCatalogHash(catalogHash)
             val transaction = activeTransaction(safeId)
+            requireTransactionPackage(transaction, packageName)
             val journal = File(transaction, "journal.txt")
             appendDiagnostic(safeId, "commit_snapshot", transactionDetail(transaction))
-            require(File(transaction, "catalog.txt").readText().trim() == expectedHash) {
-                "transaction catalog가 다릅니다."
-            }
+            require(File(transaction, "catalog.txt").readText().trim() == expectedHash) { "transaction catalog가 다릅니다." }
             require(readJournal(journal).isNotEmpty()) { "적용된 patch 파일이 없습니다." }
             val state = JSONObject()
                 .put("schemaVersion", 1)
+                .put("packageName", packageName)
                 .put("gameVersion", gameVersion)
                 .put("catalogHash", expectedHash)
                 .put("patchVersion", patchVersion)
@@ -401,10 +453,11 @@ class PatchUserService : IPatchService.Stub() {
     }
 
     @Synchronized
-    override fun rollbackPatch(transactionId: String) {
+    override fun rollbackPatch(transactionId: String, packageName: String) = with(storageFor(packageName)) {
         val safeId = requireTransactionId(transactionId)
         diagnosticOperation(safeId, "rollback_patch") {
             val transaction = transactionRoot(safeId)
+            if (transaction.isDirectory) requireTransactionPackage(transaction, packageName)
             appendDiagnostic(safeId, "rollback_snapshot", transactionDetail(transaction))
             if (transaction.isDirectory) rollbackTransaction(transaction)
             appendDiagnostic(safeId, "rollback_complete", "transactionExists=${transaction.exists()}")
@@ -412,42 +465,41 @@ class PatchUserService : IPatchService.Stub() {
     }
 
     @Synchronized
-    override fun getPatchDiagnostics(transactionId: String): String {
-        val safeId = requireTransactionId(transactionId)
-        val transaction = transactionRoot(safeId)
-        val events = JSONArray()
-        var readError = ""
-        if (diagnosticsFile.isFile) {
-            runCatching {
-                diagnosticsFile.useLines { lines ->
-                    lines.take(MAX_DIAGNOSTIC_EVENTS).forEach { line ->
-                        if (line.isNotBlank()) {
-                            val event = JSONObject(line)
-                            if (event.optString("transactionId") == safeId) events.put(event)
+    override fun getPatchDiagnostics(transactionId: String, packageName: String): String =
+        with(storageFor(packageName)) {
+            val safeId = requireTransactionId(transactionId)
+            val transaction = transactionRoot(safeId)
+            val events = JSONArray()
+            var readError = ""
+            if (diagnosticsFile.isFile) {
+                runCatching {
+                    diagnosticsFile.useLines { lines ->
+                        lines.take(MAX_DIAGNOSTIC_EVENTS).forEach { line ->
+                            if (line.isNotBlank()) {
+                                val event = JSONObject(line)
+                                if (event.optString("transactionId") == safeId) events.put(event)
+                            }
                         }
                     }
-                }
-            }.onFailure { error ->
-                readError = error.message ?: error.javaClass.simpleName
+                }.onFailure { error -> readError = error.message ?: error.javaClass.simpleName }
             }
+            JSONObject()
+                .put("schemaVersion", 1)
+                .put("serviceInfo", getServiceInfo())
+                .put("transactionId", safeId)
+                .put("events", events)
+                .put("transaction", transactionSnapshot(transaction))
+                .put("diagnosticsFileExists", diagnosticsFile.isFile)
+                .put("diagnosticsFileBytes", diagnosticsFile.takeIf(File::isFile)?.length() ?: 0L)
+                .put("readError", readError)
+                .toString()
         }
-        return JSONObject()
-            .put("schemaVersion", 1)
-            .put("serviceInfo", getServiceInfo())
-            .put("transactionId", safeId)
-            .put("events", events)
-            .put("transaction", transactionSnapshot(transaction))
-            .put("diagnosticsFileExists", diagnosticsFile.isFile)
-            .put("diagnosticsFileBytes", diagnosticsFile.takeIf(File::isFile)?.length() ?: 0L)
-            .put("readError", readError)
-            .toString()
-    }
 
     @Synchronized
-    override fun restorePatch(): String {
-        forceStopGame()
+    override fun restorePatch(packageName: String): String = with(storageFor(packageName)) {
+        forceStopGame(packageName)
         recoverInterruptedTransactions()
-        val state = readState() ?: return "복원할 한글패치가 없습니다."
+        val state = readState() ?: return@with "복원할 한글패치가 없습니다."
         val catalogHash = requireCatalogHash(state.getString("catalogHash"))
         require(discoverCatalog().second == catalogHash) {
             "게임 catalog가 패치 적용 후 변경되어 자동 복원을 중단했습니다."
@@ -462,11 +514,12 @@ class PatchUserService : IPatchService.Stub() {
         }
         if (!stateFile.delete()) error("patch 상태 파일을 정리할 수 없습니다.")
         deleteRecursively(backupRoot)
-        return "원본 파일 ${backups.size}개를 복원했습니다."
+        "원본 파일 ${backups.size}개를 복원했습니다."
     }
 
-    private fun forceStopGame() {
-        val process = ProcessBuilder("/system/bin/am", "force-stop", GAME_PACKAGE)
+    private fun forceStopGame(packageName: String) {
+        require(packageName in GameTarget.supportedPackages) { "지원하지 않는 게임 패키지입니다." }
+        val process = ProcessBuilder("/system/bin/am", "force-stop", packageName)
             .redirectErrorStream(true)
             .start()
         val output = process.inputStream.bufferedReader().use { it.readText().take(1024) }
@@ -571,7 +624,7 @@ class PatchUserService : IPatchService.Stub() {
         gameInstallRoot.listFiles()?.forEach(::deleteRecursively)
     }
 
-    private fun discoverCatalog(): Pair<String, String> {
+    private fun TargetStorage.discoverCatalog(): Pair<String, String> {
         val candidates = addressablesRoot.listFiles()
             ?.filter { it.isFile && it.name.startsWith("catalog_") && it.name.endsWith(".hash") }
             .orEmpty()
@@ -583,11 +636,11 @@ class PatchUserService : IPatchService.Stub() {
         return version to hash
     }
 
-    private fun recoverInterruptedTransactions() {
-        transactionsRoot.listFiles()?.filter { it.isDirectory }?.forEach(::rollbackTransaction)
+    private fun TargetStorage.recoverInterruptedTransactions() {
+        transactionsRoot.listFiles()?.filter { it.isDirectory }?.forEach { rollbackTransaction(it) }
     }
 
-    private fun rollbackTransaction(transaction: File) {
+    private fun TargetStorage.rollbackTransaction(transaction: File) {
         val journal = File(transaction, "journal.txt")
         readJournal(journal).asReversed().forEach { relative ->
             val previous = File(transaction, "previous/$relative")
@@ -596,7 +649,7 @@ class PatchUserService : IPatchService.Stub() {
         deleteRecursively(transaction)
     }
 
-    private fun activeTransaction(transactionId: String): File {
+    private fun TargetStorage.activeTransaction(transactionId: String): File {
         val transaction = transactionRoot(requireTransactionId(transactionId))
         require(transaction.isDirectory && File(transaction, "catalog.txt").isFile) {
             "활성 patch transaction을 찾지 못했습니다."
@@ -604,14 +657,21 @@ class PatchUserService : IPatchService.Stub() {
         return transaction
     }
 
-    private fun transactionRoot(transactionId: String): File = safePath(transactionsRoot, transactionId)
+    private fun requireTransactionPackage(transaction: File, packageName: String) {
+        val packageFile = File(transaction, "package.txt")
+        require(packageFile.isFile && packageFile.readText().trim() == packageName) {
+            "patch transaction 대상 게임이 다릅니다."
+        }
+    }
 
-    private fun resolveExistingBundle(relativePath: String): File {
+    private fun TargetStorage.transactionRoot(transactionId: String): File = safePath(transactionsRoot, transactionId)
+
+    private fun TargetStorage.resolveExistingBundle(relativePath: String): File {
         return findExistingBundle(relativePath)
             ?: error("게임이 아직 필요한 리소스를 다운로드하지 않았습니다: $relativePath")
     }
 
-    private fun findExistingBundle(relativePath: String): File? {
+    private fun TargetStorage.findExistingBundle(relativePath: String): File? {
         val exact = safePath(bundleRoot, relativePath)
         if (exact.isFile) return exact
         val alternate = when {
@@ -626,7 +686,7 @@ class PatchUserService : IPatchService.Stub() {
         return null
     }
 
-    private fun receiveVerified(
+    private fun TargetStorage.receiveVerified(
         descriptor: ParcelFileDescriptor,
         target: File,
         expectedSize: Long,
@@ -659,7 +719,7 @@ class PatchUserService : IPatchService.Stub() {
         verifyFile(target, expectedSize, expectedSha, "수신된 payload")
     }
 
-    private fun copyVerified(
+    private fun TargetStorage.copyVerified(
         source: File,
         target: File,
         transactionId: String? = null,
@@ -671,7 +731,7 @@ class PatchUserService : IPatchService.Stub() {
         verifyFile(target, size, hash, "backup")
     }
 
-    private fun copyFile(
+    private fun TargetStorage.copyFile(
         source: File,
         target: File,
         transactionId: String? = null,
@@ -688,7 +748,7 @@ class PatchUserService : IPatchService.Stub() {
         }
     }
 
-    private fun replaceFile(
+    private fun TargetStorage.replaceFile(
         source: File,
         target: File,
         transactionId: String? = null,
@@ -713,7 +773,7 @@ class PatchUserService : IPatchService.Stub() {
         verifyFile(target, expectedSize, expectedSha, "교체된 파일")
     }
 
-    private fun overwriteExistingFile(
+    private fun TargetStorage.overwriteExistingFile(
         source: File,
         target: File,
         transactionId: String? = null,
@@ -755,7 +815,7 @@ class PatchUserService : IPatchService.Stub() {
         return digest.digest().toHex()
     }
 
-    private fun appendJournal(journal: File, relativePath: String, transactionId: String) {
+    private fun TargetStorage.appendJournal(journal: File, relativePath: String, transactionId: String) {
         ensureParent(journal)
         FileOutputStream(journal, true).use { output ->
             output.write((relativePath + "\n").toByteArray(Charsets.UTF_8))
@@ -765,7 +825,7 @@ class PatchUserService : IPatchService.Stub() {
         require(readJournal(journal).lastOrNull() == relativePath) { "patch journal 기록을 확인할 수 없습니다." }
     }
 
-    private fun syncBestEffort(
+    private fun TargetStorage.syncBestEffort(
         output: FileOutputStream,
         transactionId: String? = null,
         operation: String,
@@ -783,7 +843,7 @@ class PatchUserService : IPatchService.Stub() {
         if (!journal.isFile) emptyList()
         else journal.readLines().filter { it.isNotBlank() }.map(PatchProtocol::safeRelativePath)
 
-    private inline fun <T> diagnosticOperation(
+    private inline fun <T> TargetStorage.diagnosticOperation(
         transactionId: String,
         stage: String,
         detail: String = "",
@@ -806,7 +866,7 @@ class PatchUserService : IPatchService.Stub() {
         }
     }
 
-    private fun resetDiagnostics(transactionId: String, detail: String) {
+    private fun TargetStorage.resetDiagnostics(transactionId: String, detail: String) {
         runCatching {
             ensureParent(diagnosticsFile)
             FileOutputStream(diagnosticsFile, false).use { output -> output.fd.sync() }
@@ -814,7 +874,7 @@ class PatchUserService : IPatchService.Stub() {
         appendDiagnostic(transactionId, "diagnostics_started", detail)
     }
 
-    private fun appendDiagnostic(transactionId: String, stage: String, detail: String) {
+    private fun TargetStorage.appendDiagnostic(transactionId: String, stage: String, detail: String) {
         runCatching {
             ensureParent(diagnosticsFile)
             if (diagnosticsFile.isFile && diagnosticsFile.length() >= MAX_DIAGNOSTIC_FILE_BYTES) return@runCatching
@@ -871,13 +931,13 @@ class PatchUserService : IPatchService.Stub() {
     private fun countFiles(root: File): Int =
         if (!root.isDirectory) 0 else root.walkTopDown().count { it.isFile }
 
-    private fun readState(): JSONObject? =
+    private fun TargetStorage.readState(): JSONObject? =
         if (!stateFile.isFile) null
         else JSONObject(stateFile.readText()).also {
             require(it.getInt("schemaVersion") == 1) { "지원하지 않는 patch 상태입니다." }
         }
 
-    private fun writeTextAtomic(target: File, value: String) {
+    private fun TargetStorage.writeTextAtomic(target: File, value: String) {
         ensureParent(target)
         val temporary = File(target.parentFile, "${target.name}.tmp")
         FileOutputStream(temporary).use { output ->

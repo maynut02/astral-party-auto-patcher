@@ -10,6 +10,7 @@ windows-patcher/target/
 # Android / Gradle
 .gradle/
 **/build/
+.local-tools/
 local.properties
 android-patcher/AstralAndroidPatcher.apk
 
@@ -31,3 +32,6 @@ android-patcher/AstralAndroidPatcher.apk
 .idea/
 .DS_Store
 Thumbs.db
+
+
+.agents

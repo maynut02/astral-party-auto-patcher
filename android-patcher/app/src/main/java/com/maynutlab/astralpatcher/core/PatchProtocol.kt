@@ -5,9 +5,7 @@ import java.net.URI
 import java.security.MessageDigest
 import java.util.Locale
 
-const val GAME_PACKAGE = "com.feimo.astralpartyjpn"
 const val SHIZUKU_PACKAGE = "moe.shizuku.privileged.api"
-const val PATCH_ROUTE = "INT_ANDROID"
 const val PATCH_CHANNEL = "release"
 const val RELEASE_INDEX_URL =
     "https://raw.githubusercontent.com/maynut02/astral-party-korean-patch/distribution/release-index.json"
@@ -25,12 +23,14 @@ data class CatalogIdentity(
 )
 
 data class ReleaseEntry(
+    val route: String,
     val gameVersion: String,
     val revision: String,
     val catalogHash: String,
     val patchVersion: String,
     val manifestUrl: String,
     val manifestSha256: String,
+    val uploadedAt: String? = null,
 )
 
 data class PatchFile(
@@ -48,6 +48,7 @@ data class PatchFile(
 )
 
 data class PatchManifest(
+    val route: String,
     val patchVersion: String,
     val gameVersion: String,
     val revision: String,
@@ -114,14 +115,49 @@ object PatchProtocol {
         )
     }
 
-    fun resolveRelease(json: String, catalog: CatalogIdentity): ReleaseEntry? {
+    fun latestReleaseForRoute(json: String, route: String, gameVersion: String? = null): ReleaseEntry? {
+        val root = JSONObject(json)
+        require(root.getInt("schemaVersion") == 1) { "지원하지 않는 release index입니다." }
+        val releases = root.getJSONArray("releases")
+        val matches = buildList {
+            for (index in 0 until releases.length()) {
+                val item = releases.getJSONObject(index)
+                if (item.getString("route") != route || item.getString("channel") != PATCH_CHANNEL) continue
+                if (gameVersion != null && item.getString("gameVersion") != gameVersion) continue
+                val manifestUrl = item.getString("manifestUrl")
+                TrustedUrls.requireReleaseAsset(manifestUrl)
+                add(
+                    ReleaseEntry(
+                        route = route,
+                        gameVersion = item.getString("gameVersion"),
+                        revision = item.getString("revision"),
+                        catalogHash = requireHex(item.getString("catalogHash"), 32, "catalog hash"),
+                        patchVersion = item.getString("patchVersion").also {
+                            require(it.isNotBlank()) { "patch version이 비어 있습니다." }
+                        },
+                        uploadedAt = item.optString("uploadedAt").takeIf { it.isNotBlank() },
+                        manifestUrl = manifestUrl,
+                        manifestSha256 = requireHex(item.getString("manifestSha256"), 64, "manifest SHA-256"),
+                    )
+                )
+            }
+        }
+        return matches.maxWithOrNull(Comparator { left, right ->
+            val versionOrder = compareVersionStrings(left.gameVersion, right.gameVersion)
+            if (versionOrder != 0) versionOrder
+            else (left.revision.removePrefix("r").toLongOrNull() ?: -1L)
+                .compareTo(right.revision.removePrefix("r").toLongOrNull() ?: -1L)
+        })
+    }
+
+    fun resolveRelease(json: String, catalog: CatalogIdentity, route: String): ReleaseEntry? {
         val root = JSONObject(json)
         require(root.getInt("schemaVersion") == 1) { "지원하지 않는 release index입니다." }
         val releases = root.getJSONArray("releases")
         var matched: ReleaseEntry? = null
         for (index in 0 until releases.length()) {
             val item = releases.getJSONObject(index)
-            if (item.getString("route") != PATCH_ROUTE ||
+            if (item.getString("route") != route ||
                 item.getString("channel") != PATCH_CHANNEL ||
                 item.getString("gameVersion") != catalog.gameVersion ||
                 item.getString("catalogHash").lowercase(Locale.ROOT) != catalog.catalogHash
@@ -132,12 +168,14 @@ object PatchProtocol {
             val manifestUrl = item.getString("manifestUrl")
             TrustedUrls.requireReleaseAsset(manifestUrl)
             matched = ReleaseEntry(
+                route = route,
                 gameVersion = item.getString("gameVersion"),
                 revision = item.getString("revision"),
                 catalogHash = requireHex(item.getString("catalogHash"), 32, "catalog hash"),
                 patchVersion = item.getString("patchVersion").also {
                     require(it.isNotBlank()) { "patch version이 비어 있습니다." }
                 },
+                uploadedAt = item.optString("uploadedAt").takeIf { it.isNotBlank() },
                 manifestUrl = manifestUrl,
                 manifestSha256 = requireHex(
                     item.getString("manifestSha256"), 64, "manifest SHA-256"
@@ -147,7 +185,7 @@ object PatchProtocol {
         return matched
     }
 
-    fun parseManifest(bytes: ByteArray, release: ReleaseEntry): PatchManifest {
+    fun parseManifest(bytes: ByteArray, release: ReleaseEntry, expectedRoute: String): PatchManifest {
         require(sha256(bytes) == release.manifestSha256) {
             "manifest SHA-256이 release index와 일치하지 않습니다."
         }
@@ -155,7 +193,8 @@ object PatchProtocol {
         require(root.getInt("schemaVersion") == 2) { "지원하지 않는 patch manifest입니다." }
         val patch = root.getJSONObject("patch")
         val game = root.getJSONObject("game")
-        require(patch.getString("route") == PATCH_ROUTE) { "Android용 patch가 아닙니다." }
+        require(release.route == expectedRoute) { "release route가 선택한 게임과 다릅니다." }
+        require(patch.getString("route") == expectedRoute) { "선택한 게임용 patch가 아닙니다." }
         require(patch.getString("channel") == PATCH_CHANNEL) { "정식 patch가 아닙니다." }
         require(patch.getString("version") == release.patchVersion) { "patch version이 다릅니다." }
         require(game.getString("version") == release.gameVersion) { "게임 버전이 다릅니다." }
@@ -208,6 +247,7 @@ object PatchProtocol {
             }
         }
         return PatchManifest(
+            route = expectedRoute,
             patchVersion = release.patchVersion,
             gameVersion = release.gameVersion,
             revision = release.revision,
@@ -349,6 +389,17 @@ object PatchProtocol {
             diagnosticsFileBytes = root.getLong("diagnosticsFileBytes").also { require(it >= 0) },
             readError = limitedText(root.optString("readError"), MAX_DIAGNOSTIC_DETAIL_CHARS, "진단 읽기 오류"),
         )
+    }
+
+    private fun compareVersionStrings(left: String, right: String): Int {
+        val leftParts = left.split('.').map { it.toLongOrNull() ?: 0L }
+        val rightParts = right.split('.').map { it.toLongOrNull() ?: 0L }
+        for (index in 0 until maxOf(leftParts.size, rightParts.size)) {
+            val compared = leftParts.getOrElse(index) { 0L }
+                .compareTo(rightParts.getOrElse(index) { 0L })
+            if (compared != 0) return compared
+        }
+        return 0
     }
 
     fun safeRelativePath(value: String): String {

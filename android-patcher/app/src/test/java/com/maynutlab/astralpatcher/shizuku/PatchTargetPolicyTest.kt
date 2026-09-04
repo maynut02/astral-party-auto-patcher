@@ -5,13 +5,51 @@ import org.junit.Test
 
 class PatchTargetPolicyTest {
     @Test
-    fun acceptsAnyExistingPatchTarget() {
-        assertEquals(PatchTargetState.READY, classifyPatchTarget(targetExists = true))
+    fun acceptsMatchingOriginalPatchTarget() {
+        assertEquals(
+            PatchTargetState.READY,
+            classifyPatchTarget(
+                targetExists = true,
+                sourceMatches = true,
+                payloadMatches = false,
+            ),
+        )
+    }
+
+    @Test
+    fun acceptsMatchingPatchedTarget() {
+        assertEquals(
+            PatchTargetState.READY,
+            classifyPatchTarget(
+                targetExists = true,
+                sourceMatches = false,
+                payloadMatches = true,
+            ),
+        )
     }
 
     @Test
     fun rejectsMissingPatchTarget() {
-        assertEquals(PatchTargetState.MISSING, classifyPatchTarget(targetExists = false))
+        assertEquals(
+            PatchTargetState.MISSING,
+            classifyPatchTarget(
+                targetExists = false,
+                sourceMatches = false,
+                payloadMatches = false,
+            ),
+        )
+    }
+
+    @Test
+    fun rejectsIncompatibleExistingPatchTarget() {
+        assertEquals(
+            PatchTargetState.INCOMPATIBLE,
+            classifyPatchTarget(
+                targetExists = true,
+                sourceMatches = false,
+                payloadMatches = false,
+            ),
+        )
     }
 
     @Test

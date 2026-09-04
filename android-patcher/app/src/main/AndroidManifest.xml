@@ -6,6 +6,8 @@
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="com.feimo.astralpartyjpn" />
+        <package android:name="com.feimo.astralparty" />
+        <package android:name="com.feimo.astralparty.bilibili" />
     </queries>
 
     <application
