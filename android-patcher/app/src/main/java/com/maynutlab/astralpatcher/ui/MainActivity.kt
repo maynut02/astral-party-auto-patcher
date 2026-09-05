@@ -351,7 +351,7 @@ private class PatchController(private val activity: MainActivity) {
                 else -> "리소스 확인 중"
             },
             resourceStatus = when {
-                !gameReady -> "게임 설치가 필요합니다"
+                !gameReady -> "게임이 설치되지 않았습니다"
                 !permissionGranted -> "Shizuku 활성화 및 권한이 필요합니다"
                 else -> "리소스 상태를 확인 중입니다"
             },
@@ -1348,7 +1348,7 @@ private fun PatchManagerScreen(
             modifier = Modifier.width(dialogWidth),
             properties = DialogProperties(usePlatformDefaultWidth = false),
             title = { Text("앱 업데이트") },
-            text = { Text("새 버전 ${displayVersion}을 사용할 수 있습니다.") },
+            text = { Text("새 버전을 사용할 수 있습니다.\n$displayVersion") },
             dismissButton = {
                 TextButton(onClick = { deferredUpdateVersion = updateVersion }) {
                     Text("나중에")
@@ -1695,14 +1695,20 @@ private fun EnvironmentStatusSection(
                         {
                             FilledTonalButton(
                                 onClick = onGame,
-                                enabled = !state.busy,
+                                enabled = state.shizukuReady && !state.busy,
                             ) {
                                 Text("설치")
                             }
                         }
                     },
                     supportingContent = {
-                        Text(gameApkStatusDescription(state.selectedTarget, install))
+                        Text(
+                            gameApkStatusDescription(
+                                state.selectedTarget,
+                                install,
+                                state.shizukuReady,
+                            )
+                        )
                     },
                     content = { Text(gameApkStatusLabel(state.selectedTarget, install)) },
                 )
@@ -1932,7 +1938,7 @@ private fun ExecutionLogSection(
             ) {
                 SelectionContainer {
                     Text(
-                        if (visibleLogs.isEmpty()) "상태를 새로고침하면 여기에 기록이 표시됩니다."
+                        if (visibleLogs.isEmpty()) "이곳에 로그가 표시됩니다."
                         else visibleLogs.joinToString("\n\n"),
                         modifier = Modifier.padding(PatcherSpacing.progress),
                         style = MaterialTheme.typography.bodySmall,
@@ -2171,8 +2177,13 @@ private fun gameApkStatusLabel(target: GameTarget, install: GameInstall?): Strin
 private fun gameApkStatusDescription(
     target: GameTarget,
     install: GameInstall?,
+    shizukuReady: Boolean = true,
 ): String = when {
-    install == null && target.supportsOriginalInstall -> "설치 가능"
+    install == null && target.supportsOriginalInstall -> if (shizukuReady) {
+        "설치 가능"
+    } else {
+        "설치 가능 • Shizuku 활성화 및 권한이 필요합니다"
+    }
     install == null -> "스토어에서 吉星派对를 설치해 주세요"
     target.supportsOriginalInstall && !install.installedFromPlay -> "게임을 삭제 후 재설치해 주세요"
     else -> "v${install.version}"
