@@ -156,12 +156,15 @@ class MainActivity : ComponentActivity() {
 internal data class PatchUiState(
     val selectedTarget: GameTarget = GameTarget.INT_ANDROID,
     val gameInstalls: Map<GameTarget, GameInstall> = emptyMap(),
+    val shizukuLabel: String = "Shizuku 확인 중",
     val shizukuStatus: String = "확인 중",
     val shizukuReady: Boolean = false,
     val shizukuActionLabel: String = "설정",
+    val resourceLabel: String = "리소스 확인 중",
     val resourceStatus: String = "대기 중",
     val resourceIndicator: StatusIndicator = StatusIndicator.PENDING,
     val resourceNeedsDownload: Boolean = false,
+    val releaseLabel: String = "한글패치 확인 중",
     val releaseStatus: String = "대기 중",
     val releaseIndicator: StatusIndicator = StatusIndicator.PENDING,
     val latestPatchVersion: String? = null,
@@ -323,11 +326,17 @@ private class PatchController(private val activity: MainActivity) {
         state = state.copy(
             selectedTarget = selected,
             gameInstalls = installs,
+            shizukuLabel = when {
+                !shizukuInstalled -> "Shizuku 미설치"
+                !binderReady -> "Shizuku 비활성화"
+                !permissionGranted -> "Shizuku 권한 필요"
+                else -> "Shizuku 연결됨"
+            },
             shizukuStatus = when {
-                !shizukuInstalled -> "Shizuku가 설치되지 않음"
-                !binderReady -> "설치됨 · 페어링 및 서비스 시작 필요"
-                !permissionGranted -> "연결됨 · 권한 허용 필요"
-                else -> "연결 및 권한 확인 완료"
+                !shizukuInstalled -> "설치 버튼을 눌러 Shizuku를 설치하세요"
+                !binderReady -> "열기 버튼을 눌러 페어링 및 서비스를 시작해 주세요"
+                !permissionGranted -> "권한 허용 버튼을 눌러 권한을 허용해 주세요"
+                else -> "연결 및 권한 확인이 완료되었습니다"
             },
             shizukuReady = permissionGranted,
             shizukuActionLabel = when {
@@ -336,10 +345,15 @@ private class PatchController(private val activity: MainActivity) {
                 !permissionGranted -> "권한 허용"
                 else -> "열기"
             },
+            resourceLabel = when {
+                !gameReady -> "리소스 확인 불가"
+                !permissionGranted -> "리소스 확인 불가"
+                else -> "리소스 확인 중"
+            },
             resourceStatus = when {
                 !gameReady -> "게임 설치가 필요합니다"
-                !permissionGranted -> "Shizuku 연결 후 확인합니다"
-                else -> "게임 리소스를 확인 중"
+                !permissionGranted -> "Shizuku 활성화 및 권한이 필요합니다"
+                else -> "리소스 상태를 확인 중입니다"
             },
             resourceIndicator = if (gameReady && permissionGranted) {
                 StatusIndicator.IN_PROGRESS
@@ -347,10 +361,15 @@ private class PatchController(private val activity: MainActivity) {
                 StatusIndicator.PENDING
             },
             resourceNeedsDownload = false,
+            releaseLabel = when {
+                !gameReady -> "한글패치 확인 실패"
+                !permissionGranted -> "한글패치 확인 실패"
+                else -> "한글패치 확인 중"
+            },
             releaseStatus = when {
-                !gameReady -> "게임 설치가 필요합니다"
-                !permissionGranted -> "현재 적용 상태는 Shizuku 연결 후 확인합니다"
-                else -> "현재 적용 상태를 확인 중"
+                !gameReady -> "게임이 설치되지 않았습니다"
+                !permissionGranted -> "Shizuku 활성화 및 권한이 필요합니다"
+                else -> "현재 설치 상태를 확인 중입니다"
             },
             releaseIndicator = if (gameReady && permissionGranted) {
                 StatusIndicator.IN_PROGRESS
@@ -829,11 +848,17 @@ private class PatchController(private val activity: MainActivity) {
                     main.post {
                         if (state.selectedTarget != target) return@post
                         state = state.copy(
-                            resourceStatus = "현재 게임과 일치하는 패치 manifest가 없습니다",
+                            resourceLabel = "리소스 확인 실패",
+                            resourceStatus = "패치 대상 리소스를 확인할 수 없습니다",
                             resourceIndicator = StatusIndicator.PENDING,
                             resourceNeedsDownload = false,
-                            releaseStatus = catalogIdentity.installedPatchVersion?.let { "$it 적용됨 · 호환 패치 확인 필요" }
-                                ?: "미적용 · 현재 게임과 일치하는 정식 패치 없음",
+                            releaseLabel = if (catalogIdentity.installedPatchVersion != null) {
+                                "한글패치 확인 필요"
+                            } else {
+                                "한글패치 미설치"
+                            },
+                            releaseStatus = catalogIdentity.installedPatchVersion?.let { "$it • 호환되지 않는 패치" }
+                                ?: "-",
                             releaseIndicator = StatusIndicator.PENDING,
                             patchVersion = null,
                             installedPatchVersion = catalogIdentity.installedPatchVersion,
@@ -861,20 +886,30 @@ private class PatchController(private val activity: MainActivity) {
                     if (state.selectedTarget != target) return@post
                     val installedPatch = catalogIdentity.installedPatchVersion
                     state = state.copy(
+                        resourceLabel = when {
+                            ready -> "리소스 확인 완료"
+                            targetInspection.incompatible > 0 -> "리소스 업데이트 필요"
+                            else -> "리소스 확인 실패"
+                        },
                         resourceStatus = when {
-                            ready -> "패치 대상 리소스 ${targetInspection.total}개 확인 완료"
+                            ready -> "패치 대상 리소스 ${targetInspection.total}개를 확인했습니다"
                             targetInspection.incompatible > 0 && targetInspection.missing > 0 ->
-                                "게임 리소스 업데이트 필요 · 불일치 ${targetInspection.incompatible}개 · 누락 ${targetInspection.missing}개"
+                                "${targetInspection.incompatible}개의 리소스가 일치하지 않습니다\n${targetInspection.missing}개의 리소스가 누락되었습니다"
                             targetInspection.incompatible > 0 ->
-                                "게임 리소스 업데이트 필요 · 불일치 ${targetInspection.incompatible}개"
-                            else -> "필요한 게임 리소스 ${targetInspection.missing}개가 없습니다"
+                                "${targetInspection.incompatible}개의 리소스가 일치하지 않습니다"
+                            else -> "패치 대상 리소스 ${targetInspection.missing}개를 확인할 수 없습니다"
                         },
                         resourceIndicator = if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
                         resourceNeedsDownload = targetInspection.missing > 0 || targetInspection.incompatible > 0,
+                        releaseLabel = when {
+                            installedPatch == null -> "한글패치 미설치"
+                            installedPatch == resolved.patchVersion -> "한글패치 설치됨"
+                            else -> "한글패치 업데이트 필요"
+                        },
                         releaseStatus = when {
-                            installedPatch == null -> "미적용"
-                            installedPatch == resolved.patchVersion -> "$installedPatch · 최신 버전"
-                            else -> "$installedPatch · 업데이트 필요"
+                            installedPatch == null -> "-"
+                            installedPatch == resolved.patchVersion -> "$installedPatch • 최신 버전"
+                            else -> installedPatch
                         },
                         releaseIndicator = if (installedPatch == resolved.patchVersion) {
                             StatusIndicator.COMPLETED
@@ -894,10 +929,15 @@ private class PatchController(private val activity: MainActivity) {
                 main.post {
                     if (state.selectedTarget != target) return@post
                     state = state.copy(
+                        resourceLabel = if (needsDownload) {
+                            "리소스 다운로드 필요"
+                        } else {
+                            "리소스 확인 실패"
+                        },
                         resourceStatus = when {
                             needsDownload -> "게임을 실행해 리소스를 다운로드해 주세요"
-                            currentCatalog != null && !checkingTargets -> "패치 대상 리소스를 확인할 수 없음"
-                            else -> "게임 리소스를 확인할 수 없음"
+                            currentCatalog != null && !checkingTargets -> "패치 대상 리소스를 확인할 수 없습니다"
+                            else -> "리소스를 확인할 수 없습니다"
                         },
                         resourceIndicator = if (needsDownload) {
                             StatusIndicator.PENDING
@@ -905,10 +945,11 @@ private class PatchController(private val activity: MainActivity) {
                             StatusIndicator.ERROR
                         },
                         resourceNeedsDownload = needsDownload,
+                        releaseLabel = "한글패치 확인 실패",
                         releaseStatus = if (currentCatalog != null && !checkingTargets) {
-                            "정식 패치 정보를 확인할 수 없음"
+                            "패치 정보를 확인할 수 없습니다"
                         } else {
-                            "게임 리소스 확인 필요"
+                            "리소스가 설치되지 않았습니다"
                         },
                         releaseIndicator = if (needsDownload) {
                             StatusIndicator.PENDING
@@ -1292,8 +1333,11 @@ private fun PatchManagerScreen(
         ),
         label = "refresh-icon-rotation",
     )
+    val configuration = LocalConfiguration.current
+    val screenWidth = configuration.screenWidthDp.dp
+    val wideLayout = configuration.screenWidthDp >= PatcherDimensions.twoPaneMinWidthDp
     val dialogWidth = minOf(
-        LocalConfiguration.current.screenWidthDp.dp * PatcherDimensions.dialogWidthFraction,
+        screenWidth * PatcherDimensions.dialogWidthFraction,
         PatcherDimensions.dialogMaxWidth,
     )
 
@@ -1380,7 +1424,13 @@ private fun PatchManagerScreen(
             Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .widthIn(max = 760.dp)
+                        .widthIn(
+                            max = if (wideLayout) {
+                                PatcherDimensions.wideContentMaxWidth
+                            } else {
+                                PatcherDimensions.compactContentMaxWidth
+                            }
+                        )
                         .navigationBarsPadding()
                         .verticalScroll(rememberScrollState())
                         .padding(
@@ -1391,384 +1441,84 @@ private fun PatchManagerScreen(
                     ),
                     verticalArrangement = Arrangement.spacedBy(PatcherSpacing.section),
                 ) {
-                    state.availablePatcherVersion?.let { version ->
-                        val displayVersion = if (version.startsWith("v")) version else "v$version"
-                        SectionCard(
-                            title = null,
-                            progressState = state.takeIf {
-                                it.busy && it.progressSection == ProgressSection.PATCHER_UPDATE
-                            },
-                            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
-                        ) {
-                            ListItem(
-                                colors = transparentListItemColors(),
-                                contentPadding = PaddingValues(
-                                    start = PatcherSpacing.card,
-                                    top = PatcherSpacing.small,
-                                    end = PatcherSpacing.small,
-                                    bottom = PatcherSpacing.small,
-                                ),
-                                trailingContent = {
-                                    Button(
-                                        onClick = onUpdate,
-                                        enabled = !state.busy,
-                                    ) {
-                                        Text("업데이트")
-                                    }
-                                },
-                                content = {
-                                    Text(
-                                        "새 버전 사용 가능 $displayVersion",
-                                        color = MaterialTheme.colorScheme.onTertiaryContainer,
-                                    )
-                                },
-                            )
-                        }
-                    }
-
-                    SectionCard(
-                        title = "플랫폼 선택",
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .selectableGroup()
-                                .padding(horizontal = PatcherSpacing.small, vertical = PatcherSpacing.small),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            GameTarget.entries.forEach { target ->
-                                val install = state.gameInstalls[target]
-                                val selectable = install != null || target.selectableWhenMissing
-                                val selected = state.selectedTarget == target
-                                Surface(
-                                    color = if (selected) {
-                                        MaterialTheme.colorScheme.secondaryContainer
-                                    } else {
-                                        Color.Transparent
-                                    },
-                                    contentColor = if (selected) {
-                                        MaterialTheme.colorScheme.onSecondaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurface
-                                    },
-                                    shape = RoundedCornerShape(22.dp),
-                                ) {
-                                    ListItem(
-                                        selected = selected,
-                                        onClick = { onSelectTarget(target) },
-                                        enabled = selectable && !state.busy && !state.refreshing,
-                                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                                        leadingContent = {
-                                            RadioButton(
-                                                selected = selected,
-                                                onClick = null,
-                                                enabled = selectable && !state.busy && !state.refreshing,
-                                            )
-                                        },
-                                        supportingContent = {
-                                            Text(gameTargetDescription(target, install))
-                                        },
-                                        content = {
-                                            Text(target.displayName, fontWeight = FontWeight.Medium)
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(PatcherSpacing.attached),
-                    ) {
-                        SectionCard(
-                            title = null,
-                            topCorner = PatcherShapes.card,
-                            bottomCorner = PatcherShapes.attached,
-                            progressState = state.takeIf {
-                                it.busy && it.progressSection == ProgressSection.SHIZUKU
-                            },
-                        ) {
-                            ListItem(
-                                colors = transparentListItemColors(),
-                                leadingContent = {
-                                    StatusIndicatorDot(
-                                        if (state.shizukuStatus == "확인 중") StatusIndicator.IN_PROGRESS
-                                        else if (state.shizukuReady) StatusIndicator.COMPLETED
-                                        else StatusIndicator.PENDING,
-                                    )
-                                },
-                                trailingContent = {
-                                    FilledTonalButton(
-                                        onClick = onShizuku,
-                                        enabled = !state.busy,
-                                    ) {
-                                        Text(state.shizukuActionLabel)
-                                    }
-                                },
-                                supportingContent = { Text(state.shizukuStatus) },
-                                content = { Text("Shizuku 상태") },
-                            )
-                        }
-
-                        SectionCard(
-                            title = null,
-                            topCorner = PatcherShapes.attached,
-                            bottomCorner = PatcherShapes.attached,
-                            progressState = state.takeIf {
-                                it.busy && it.progressSection == ProgressSection.APK
-                            },
-                        ) {
-                            val install = state.selectedInstall
-                            val ready = state.gameReady
-                            if (state.selectedTarget.supportsOriginalInstall) {
-                                ListItem(
-                                    colors = transparentListItemColors(),
-                                    leadingContent = {
-                                        StatusIndicatorDot(
-                                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
-                                        )
-                                    },
-                                    trailingContent = if (ready) null else {
-                                        {
-                                            FilledTonalButton(
-                                                onClick = onGame,
-                                                enabled = !state.busy,
-                                            ) {
-                                                Text("설치")
-                                            }
-                                        }
-                                    },
-                                    supportingContent = {
-                                        Text(gameApkStatusDescription(state.selectedTarget, install))
-                                    },
-                                    content = { Text("Astral Party ${state.selectedTarget.displayName}") },
-                                )
-                            } else {
-                                ListItem(
-                                    colors = transparentListItemColors(),
-                                    leadingContent = {
-                                        StatusIndicatorDot(
-                                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
-                                        )
-                                    },
-                                    supportingContent = {
-                                        Text(gameApkStatusDescription(state.selectedTarget, install))
-                                    },
-                                    content = { Text("Astral Party ${state.selectedTarget.displayName}") },
-                                )
-                            }
-                        }
-
-                        SectionCard(
-                            title = null,
-                            topCorner = PatcherShapes.attached,
-                            bottomCorner = PatcherShapes.card,
-                        ) {
-                            ListItem(
-                                colors = transparentListItemColors(),
-                                leadingContent = { StatusIndicatorDot(state.resourceIndicator) },
-                                trailingContent = if (
-                                    state.resourceIndicator == StatusIndicator.PENDING &&
-                                    state.canLaunch
-                                ) {
-                                    {
-                                        FilledTonalButton(
-                                            onClick = onLaunch,
-                                            enabled = !state.busy,
-                                        ) {
-                                            Text("게임 실행")
-                                        }
-                                    }
-                                } else {
-                                    null
-                                },
-                                supportingContent = { Text(state.resourceStatus) },
-                                content = { Text("리소스 설치 상태") },
-                            )
-                        }
-                    }
-
-                    SectionCard(
-                        title = null,
-                        progressState = state.takeIf {
-                            it.busy && it.progressSection == ProgressSection.PATCH
-                        },
-                    ) {
-                        ListItem(
-                            colors = transparentListItemColors(),
-                            leadingContent = { StatusIndicatorDot(state.releaseIndicator) },
-                            supportingContent = { Text(state.releaseStatus) },
-                            content = { Text("한글패치 설치 상태") },
-                        )
-                        SectionDivider(color = MaterialTheme.colorScheme.surfaceContainerLow)
-                        ListItem(
-                            colors = transparentListItemColors(),
-                            contentPadding = PaddingValues(
-                                start = PatcherSpacing.latestVersion,
-                                end = PatcherSpacing.latestVersion,
-                                top = PatcherSpacing.small,
-                                bottom = 2.dp,
-                            ),
-                            trailingContent = {
-                                Text(
-                                    state.latestPatchVersion ?: state.latestPatchStatus,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            },
-                            content = {
-                                Text(
-                                    "최신 버전",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            },
-                        )
-                        ListItem(
-                            colors = transparentListItemColors(),
-                            contentPadding = PaddingValues(
-                                start = PatcherSpacing.latestVersion,
-                                end = PatcherSpacing.latestVersion,
-                                top = 2.dp,
-                                bottom = PatcherSpacing.small,
-                            ),
-                            trailingContent = {
-                                Text(
-                                    formatPatchUploadedAt(state.latestPatchUploadedAt),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            },
-                            content = {
-                                Text(
-                                    "업로드 시각",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            },
-                        )
+                    if (wideLayout) {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(
-                                    start = PatcherSpacing.card,
-                                    end = PatcherSpacing.card,
-                                    top = PatcherSpacing.small,
-                                    bottom = PatcherSpacing.card,
-                                ),
-                            horizontalArrangement = Arrangement.spacedBy(PatcherSpacing.buttonGap),
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(PatcherSpacing.section),
+                            verticalAlignment = Alignment.Top,
                         ) {
-                            FilledTonalButton(
-                                onClick = onRestore,
-                                enabled = state.canRestore,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(48.dp),
-                                shape = RoundedCornerShape(
-                                    topStart = PatcherShapes.buttonOuter,
-                                    bottomStart = PatcherShapes.buttonOuter,
-                                    topEnd = PatcherShapes.attached,
-                                    bottomEnd = PatcherShapes.attached,
-                                ),
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(PatcherSpacing.section),
                             ) {
-                                Text("원본 복구")
-                            }
-                            Button(
-                                onClick = onPatch,
-                                enabled = state.canPatch,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(48.dp),
-                                shape = RoundedCornerShape(
-                                    topStart = PatcherShapes.attached,
-                                    bottomStart = PatcherShapes.attached,
-                                    topEnd = PatcherShapes.buttonOuter,
-                                    bottomEnd = PatcherShapes.buttonOuter,
-                                ),
-                            ) {
-                                Text(
-                                    if (
-                                        state.installedPatchVersion != null &&
-                                        state.patchVersion != null &&
-                                        state.installedPatchVersion != state.patchVersion
-                                    ) {
-                                        "한글패치 업데이트"
-                                    } else {
-                                        "한글패치 설치"
-                                    }
+                                PatcherUpdateSection(state = state, onUpdate = onUpdate)
+                                GameSelectionSection(
+                                    state = state,
+                                    onSelectTarget = onSelectTarget,
                                 )
-                            }
-                        }
-                    }
-
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
-                        ),
-                        shape = MaterialTheme.shapes.extraLarge,
-                    ) {
-                        Column {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(
-                                        start = PatcherSpacing.card,
-                                        end = PatcherSpacing.screen,
-                                        top = PatcherSpacing.small,
-                                        bottom = PatcherSpacing.small,
-                                    ),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    "실행 기록",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.SemiBold,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                if (state.logs.size > 6) {
-                                    TextButton(onClick = { logsExpanded = !logsExpanded }) {
-                                        Text(if (logsExpanded) "접기" else "전체 보기")
-                                    }
-                                }
-                                IconButton(
-                                    onClick = {
+                                ExecutionLogSection(
+                                    state = state,
+                                    visibleLogs = visibleLogs,
+                                    logsExpanded = logsExpanded,
+                                    onToggleLogs = { logsExpanded = !logsExpanded },
+                                    onCopyLogs = {
                                         activityClipboardManager(context).setPrimaryClip(
                                             android.content.ClipData.newPlainText(
-                                                "실행 기록",
+                                                "실행 로그",
                                                 state.logs.joinToString("\n\n"),
                                             )
                                         )
                                     },
-                                    enabled = state.logs.isNotEmpty(),
-                                ) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_content_copy_24),
-                                        contentDescription = "실행 기록 복사",
-                                        modifier = Modifier.size(20.dp),
-                                    )
-                                }
+                                )
                             }
-
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(
-                                        start = PatcherSpacing.small,
-                                        end = PatcherSpacing.small,
-                                        bottom = PatcherSpacing.small,
-                                    ),
-                                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                shape = RoundedCornerShape(22.dp),
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(PatcherSpacing.section),
                             ) {
-                                SelectionContainer {
-                                    Text(
-                                        if (visibleLogs.isEmpty()) "상태를 새로고침하면 여기에 기록이 표시됩니다."
-                                        else visibleLogs.joinToString("\n\n"),
-                                        modifier = Modifier.padding(PatcherSpacing.progress),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
+                                EnvironmentStatusSection(
+                                    state = state,
+                                    onShizuku = onShizuku,
+                                    onGame = onGame,
+                                    onLaunch = onLaunch,
+                                )
+                                PatchStatusSection(
+                                    state = state,
+                                    onRestore = onRestore,
+                                    onPatch = onPatch,
+                                )
                             }
                         }
+                    } else {
+                        PatcherUpdateSection(state = state, onUpdate = onUpdate)
+                        GameSelectionSection(
+                            state = state,
+                            onSelectTarget = onSelectTarget,
+                        )
+                        EnvironmentStatusSection(
+                            state = state,
+                            onShizuku = onShizuku,
+                            onGame = onGame,
+                            onLaunch = onLaunch,
+                        )
+                        PatchStatusSection(
+                            state = state,
+                            onRestore = onRestore,
+                            onPatch = onPatch,
+                        )
+                        ExecutionLogSection(
+                            state = state,
+                            visibleLogs = visibleLogs,
+                            logsExpanded = logsExpanded,
+                            onToggleLogs = { logsExpanded = !logsExpanded },
+                            onCopyLogs = {
+                                activityClipboardManager(context).setPrimaryClip(
+                                    android.content.ClipData.newPlainText(
+                                        "실행 로그",
+                                        state.logs.joinToString("\n\n"),
+                                    )
+                                )
+                            },
+                        )
                     }
 
                     Spacer(
@@ -1778,6 +1528,418 @@ private fun PatchManagerScreen(
                         )
                     )
                 }
+        }
+    }
+}
+
+@Composable
+private fun PatcherUpdateSection(
+    state: PatchUiState,
+    onUpdate: () -> Unit,
+) {
+    state.availablePatcherVersion?.let { version ->
+        val displayVersion = if (version.startsWith("v")) version else "v$version"
+        SectionCard(
+            title = null,
+            progressState = state.takeIf {
+                it.busy && it.progressSection == ProgressSection.PATCHER_UPDATE
+            },
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        ) {
+            ListItem(
+                colors = transparentListItemColors(),
+                contentPadding = PaddingValues(
+                    start = PatcherSpacing.card,
+                    top = PatcherSpacing.small,
+                    end = PatcherSpacing.small,
+                    bottom = PatcherSpacing.small,
+                ),
+                trailingContent = {
+                    Button(
+                        onClick = onUpdate,
+                        enabled = !state.busy,
+                    ) {
+                        Text("업데이트")
+                    }
+                },
+                content = {
+                    Text(
+                        "새 버전 사용 가능 $displayVersion",
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun GameSelectionSection(
+    state: PatchUiState,
+    onSelectTarget: (GameTarget) -> Unit,
+) {
+    SectionCard(title = "게임 선택") {
+        Column(
+            modifier = Modifier
+                .selectableGroup()
+                .padding(horizontal = PatcherSpacing.small, vertical = PatcherSpacing.small),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            GameTarget.entries.forEach { target ->
+                val install = state.gameInstalls[target]
+                val selectable = install != null || target.selectableWhenMissing
+                val selected = state.selectedTarget == target
+                Surface(
+                    color = if (selected) {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    } else {
+                        Color.Transparent
+                    },
+                    contentColor = if (selected) {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                    shape = RoundedCornerShape(22.dp),
+                ) {
+                    ListItem(
+                        selected = selected,
+                        onClick = { onSelectTarget(target) },
+                        enabled = selectable && !state.busy && !state.refreshing,
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        leadingContent = {
+                            RadioButton(
+                                selected = selected,
+                                onClick = null,
+                                enabled = selectable && !state.busy && !state.refreshing,
+                            )
+                        },
+                        supportingContent = {
+                            Text(gameTargetDescription(target, install))
+                        },
+                        content = {
+                            Text(target.displayName, fontWeight = FontWeight.Medium)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EnvironmentStatusSection(
+    state: PatchUiState,
+    onShizuku: () -> Unit,
+    onGame: () -> Unit,
+    onLaunch: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(PatcherSpacing.attached),
+    ) {
+        SectionCard(
+            title = null,
+            topCorner = PatcherShapes.card,
+            bottomCorner = PatcherShapes.attached,
+            progressState = state.takeIf {
+                it.busy && it.progressSection == ProgressSection.SHIZUKU
+            },
+        ) {
+            ListItem(
+                colors = transparentListItemColors(),
+                leadingContent = {
+                    StatusIndicatorDot(
+                        if (state.shizukuStatus == "확인 중") StatusIndicator.IN_PROGRESS
+                        else if (state.shizukuReady) StatusIndicator.COMPLETED
+                        else StatusIndicator.PENDING,
+                    )
+                },
+                trailingContent = if (state.shizukuReady) {
+                    null
+                } else {
+                    {
+                        FilledTonalButton(
+                            onClick = onShizuku,
+                            enabled = !state.busy,
+                        ) {
+                            Text(state.shizukuActionLabel)
+                        }
+                    }
+                },
+                supportingContent = { Text(state.shizukuStatus) },
+                content = { Text(state.shizukuLabel) },
+            )
+        }
+
+        SectionCard(
+            title = null,
+            topCorner = PatcherShapes.attached,
+            bottomCorner = PatcherShapes.attached,
+            progressState = state.takeIf {
+                it.busy && it.progressSection == ProgressSection.APK
+            },
+        ) {
+            val install = state.selectedInstall
+            val ready = state.gameReady
+            if (state.selectedTarget.supportsOriginalInstall) {
+                ListItem(
+                    colors = transparentListItemColors(),
+                    leadingContent = {
+                        StatusIndicatorDot(
+                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
+                        )
+                    },
+                    trailingContent = if (ready) null else {
+                        {
+                            FilledTonalButton(
+                                onClick = onGame,
+                                enabled = !state.busy,
+                            ) {
+                                Text("설치")
+                            }
+                        }
+                    },
+                    supportingContent = {
+                        Text(gameApkStatusDescription(state.selectedTarget, install))
+                    },
+                    content = { Text(gameApkStatusLabel(state.selectedTarget, install)) },
+                )
+            } else {
+                ListItem(
+                    colors = transparentListItemColors(),
+                    leadingContent = {
+                        StatusIndicatorDot(
+                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
+                        )
+                    },
+                    supportingContent = {
+                        Text(gameApkStatusDescription(state.selectedTarget, install))
+                    },
+                    content = { Text(gameApkStatusLabel(state.selectedTarget, install)) },
+                )
+            }
+        }
+
+        SectionCard(
+            title = null,
+            topCorner = PatcherShapes.attached,
+            bottomCorner = PatcherShapes.card,
+        ) {
+            ListItem(
+                colors = transparentListItemColors(),
+                leadingContent = { StatusIndicatorDot(state.resourceIndicator) },
+                trailingContent = if (
+                    state.resourceIndicator == StatusIndicator.PENDING &&
+                    state.resourceNeedsDownload &&
+                    state.canLaunch
+                ) {
+                    {
+                        FilledTonalButton(
+                            onClick = onLaunch,
+                            enabled = !state.busy,
+                        ) {
+                            Text("게임 실행")
+                        }
+                    }
+                } else {
+                    null
+                },
+                supportingContent = { Text(state.resourceStatus) },
+                content = { Text(state.resourceLabel) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun PatchStatusSection(
+    state: PatchUiState,
+    onRestore: () -> Unit,
+    onPatch: () -> Unit,
+) {
+    SectionCard(
+        title = null,
+        progressState = state.takeIf {
+            it.busy && it.progressSection == ProgressSection.PATCH
+        },
+    ) {
+        ListItem(
+            colors = transparentListItemColors(),
+            leadingContent = { StatusIndicatorDot(state.releaseIndicator) },
+            supportingContent = { Text(state.releaseStatus) },
+            content = { Text(state.releaseLabel) },
+        )
+        SectionDivider(color = MaterialTheme.colorScheme.surfaceContainerLow)
+        ListItem(
+            colors = transparentListItemColors(),
+            contentPadding = PaddingValues(
+                start = PatcherSpacing.latestVersion,
+                end = PatcherSpacing.latestVersion,
+                top = PatcherSpacing.small,
+                bottom = 2.dp,
+            ),
+            trailingContent = {
+                Text(
+                    state.latestPatchVersion ?: state.latestPatchStatus,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            content = {
+                Text(
+                    "최신 버전",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+        )
+        ListItem(
+            colors = transparentListItemColors(),
+            contentPadding = PaddingValues(
+                start = PatcherSpacing.latestVersion,
+                end = PatcherSpacing.latestVersion,
+                top = 2.dp,
+                bottom = PatcherSpacing.small,
+            ),
+            trailingContent = {
+                Text(
+                    formatPatchUploadedAt(state.latestPatchUploadedAt),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            content = {
+                Text(
+                    "업로드 시각",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    start = PatcherSpacing.card,
+                    end = PatcherSpacing.card,
+                    top = PatcherSpacing.small,
+                    bottom = PatcherSpacing.card,
+                ),
+            horizontalArrangement = Arrangement.spacedBy(PatcherSpacing.buttonGap),
+        ) {
+            FilledTonalButton(
+                onClick = onRestore,
+                enabled = state.canRestore,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(48.dp),
+                shape = RoundedCornerShape(
+                    topStart = PatcherShapes.buttonOuter,
+                    bottomStart = PatcherShapes.buttonOuter,
+                    topEnd = PatcherShapes.attached,
+                    bottomEnd = PatcherShapes.attached,
+                ),
+            ) {
+                Text("원본 복구")
+            }
+            Button(
+                onClick = onPatch,
+                enabled = state.canPatch,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(48.dp),
+                shape = RoundedCornerShape(
+                    topStart = PatcherShapes.attached,
+                    bottomStart = PatcherShapes.attached,
+                    topEnd = PatcherShapes.buttonOuter,
+                    bottomEnd = PatcherShapes.buttonOuter,
+                ),
+            ) {
+                Text(
+                    if (
+                        state.installedPatchVersion != null &&
+                        state.patchVersion != null &&
+                        state.installedPatchVersion != state.patchVersion
+                    ) {
+                        "한글패치 업데이트"
+                    } else {
+                        "한글패치 설치"
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExecutionLogSection(
+    state: PatchUiState,
+    visibleLogs: List<String>,
+    logsExpanded: Boolean,
+    onToggleLogs: () -> Unit,
+    onCopyLogs: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLowest,
+        ),
+        shape = MaterialTheme.shapes.extraLarge,
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = PatcherSpacing.card,
+                        end = PatcherSpacing.screen,
+                        top = PatcherSpacing.small,
+                        bottom = PatcherSpacing.small,
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "실행 로그",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (state.logs.size > 6) {
+                    TextButton(onClick = onToggleLogs) {
+                        Text(if (logsExpanded) "접기" else "전체 보기")
+                    }
+                }
+                IconButton(
+                    onClick = onCopyLogs,
+                    enabled = state.logs.isNotEmpty(),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_content_copy_24),
+                        contentDescription = "실행 로그 복사",
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = PatcherSpacing.small,
+                        end = PatcherSpacing.small,
+                        bottom = PatcherSpacing.small,
+                    ),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                shape = RoundedCornerShape(22.dp),
+            ) {
+                SelectionContainer {
+                    Text(
+                        if (visibleLogs.isEmpty()) "상태를 새로고침하면 여기에 기록이 표시됩니다."
+                        else visibleLogs.joinToString("\n\n"),
+                        modifier = Modifier.padding(PatcherSpacing.progress),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
@@ -1980,7 +2142,10 @@ private object PatcherShapes {
 
 private object PatcherDimensions {
     const val dialogWidthFraction = 0.7f
+    const val twoPaneMinWidthDp = 840
     val dialogMaxWidth = 560.dp
+    val compactContentMaxWidth = 760.dp
+    val wideContentMaxWidth = 1200.dp
     val fabClearance = 80.dp
 }
 
@@ -1997,12 +2162,20 @@ private fun gameTargetDescription(target: GameTarget, install: GameInstall?): St
     else -> "${target.packageName} • 설치됨 • v${install.version}"
 }
 
-private fun gameApkStatusDescription(target: GameTarget, install: GameInstall?): String = when {
-    install == null && target.supportsOriginalInstall -> "미설치 • Google Play 원본 설치 가능"
-    install == null -> "미설치"
-    target.supportsOriginalInstall && !install.installedFromPlay ->
-        "설치됨 • v${install.version} • Google Play 설치본 아님"
-    else -> "설치됨 • v${install.version}"
+private fun gameApkStatusLabel(target: GameTarget, install: GameInstall?): String = when {
+    install == null -> "${target.displayName} 게임 미설치"
+    target.supportsOriginalInstall && !install.installedFromPlay -> "${target.displayName} 설치 오류"
+    else -> "${target.displayName} 설치됨"
+}
+
+private fun gameApkStatusDescription(
+    target: GameTarget,
+    install: GameInstall?,
+): String = when {
+    install == null && target.supportsOriginalInstall -> "설치 가능"
+    install == null -> "스토어에서 吉星派对를 설치해 주세요"
+    target.supportsOriginalInstall && !install.installedFromPlay -> "게임을 삭제 후 재설치해 주세요"
+    else -> "v${install.version}"
 }
 
 private fun activityClipboardManager(context: android.content.Context): android.content.ClipboardManager =
