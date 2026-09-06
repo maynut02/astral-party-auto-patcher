@@ -40,8 +40,8 @@ def test_runtime_repository_boundaries_are_split() -> None:
     windows = (ROOT / "windows-patcher/src/cli.rs").read_text(encoding="utf-8")
     android = (ROOT / "android-patcher/app/src/main/java/com/maynutlab/astralpatcher/core/PatchProtocol.kt").read_text(encoding="utf-8")
     assert "astral-party-korean-patch/distribution/release-index.json" in windows
-    assert "astral-party-auto-patcher/distribution/patcher-index.json" in windows
-    assert "astral-party-auto-patcher/releases/download" in windows
+    assert "astral-party-auto-patcher/distribution/patcher-index.json" not in windows
+    assert "astral-party-auto-patcher/releases/download" not in windows
     assert "astral-party-korean-patch/distribution/release-index.json" in android
     assert "astral-party-auto-patcher/distribution/mobile-patcher-index.json" in android
     assert "astral-party-auto-patcher/distribution/android-game-index.json" in android
