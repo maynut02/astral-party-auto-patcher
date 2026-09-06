@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +46,61 @@ impl InstallRoots {
     }
 }
 
+/// The game roots an installation record belongs to.
+///
+/// Ownership records are persisted outside the game directory.  Keeping the roots alongside
+/// those records prevents a record created for one game installation from authorizing a delete
+/// or restore in a different installation after the user retargets the patcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallRootBinding {
+    pub addressables: String,
+    pub game_data: String,
+}
+
+impl InstallRootBinding {
+    pub fn from_roots(roots: &InstallRoots) -> Self {
+        Self {
+            addressables: root_identity(&roots.addressables),
+            game_data: root_identity(&roots.game_data),
+        }
+    }
+
+    pub fn matches_roots(&self, roots: &InstallRoots) -> bool {
+        self == &Self::from_roots(roots)
+    }
+}
+
+fn root_identity(path: &Path) -> String {
+    // Canonicalizing existing roots also resolves junctions/symlinks.  A root may not exist yet
+    // for a create-only patch, so fall back to an absolute lexical path in that case.
+    let absolute = fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_owned());
+    let value = absolute.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        let mut value = value;
+        // Windows canonicalize commonly returns the extended `\\?\` prefix while an absent
+        // root falls back to a normal absolute path.  Store one spelling so deleting a root and
+        // selecting it again does not make a valid ownership record look unrelated.
+        let lower = value.to_ascii_lowercase();
+        if lower.starts_with("//?/unc/") {
+            value = format!("//{}", &value[8..]);
+        } else if lower.starts_with("//?/") {
+            value = value[4..].to_owned();
+        }
+        while value.len() > 3 && value.ends_with('/') {
+            value.pop();
+        }
+        value.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedCreatedFile {
@@ -69,8 +125,21 @@ pub struct OwnershipManifest {
     pub schema_version: u32,
     pub patch_version: String,
     pub catalog_hash: String,
+    #[serde(default)]
+    pub installed_at: Option<String>,
+    /// Absent only for records written by versions before root binding was introduced.
+    #[serde(default)]
+    pub root_binding: Option<InstallRootBinding>,
     pub created_files: Vec<OwnedCreatedFile>,
     pub modified_files: Vec<OwnedModifiedFile>,
+}
+
+impl OwnershipManifest {
+    pub fn applies_to(&self, roots: &InstallRoots) -> bool {
+        self.root_binding
+            .as_ref()
+            .is_some_and(|binding| binding.matches_roots(roots))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,27 +288,6 @@ fn staged_path(
     Ok(staging_root.join(target.staging_dir()).join(relative))
 }
 
-fn backup_path(
-    backup_root: &Path,
-    target: InstallTarget,
-    relative: &str,
-) -> Result<PathBuf, InstallError> {
-    validate_relative_path(relative)?;
-    Ok(backup_root.join(target.staging_dir()).join(relative))
-}
-
-fn rollback_path(
-    staging_root: &Path,
-    target: InstallTarget,
-    relative: &str,
-) -> Result<PathBuf, InstallError> {
-    validate_relative_path(relative)?;
-    Ok(staging_root
-        .join("rollback")
-        .join(target.staging_dir())
-        .join(relative))
-}
-
 pub fn validate_patch_targets(
     manifest: &PatchManifest,
     roots: &InstallRoots,
@@ -251,7 +299,12 @@ pub fn validate_patch_targets(
             "replace" if !destination.is_file() => {
                 return Err(InstallError::ReplaceTargetMissing(destination));
             }
-            "create" if destination.exists() => {
+            "create"
+                if destination.exists()
+                    && (!destination.is_file()
+                        || destination.metadata()?.len() != file.size
+                        || sha256_file(&destination)? != file.sha256) =>
+            {
                 return Err(InstallError::CreateTargetExists(destination));
             }
             "replace" | "create" => {}
@@ -263,6 +316,84 @@ pub fn validate_patch_targets(
 
 fn copy_replace(source: &Path, destination: &Path) -> Result<(), io::Error> {
     copy_replace_with_progress(source, destination, |_, _| {})
+}
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    path.with_file_name(format!(
+        ".{file_name}.astral-tmp-{}-{counter}",
+        std::process::id()
+    ))
+}
+
+/// Atomically move `source` over `destination`.
+///
+/// `std::fs::rename` cannot replace an existing file on Windows.  Removing the destination first
+/// creates a window in which a game file is absent, so use the Windows replace-existing API and
+/// request write-through semantics.  Unix rename already has the required replacement semantics.
+fn replace_existing(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both vectors are NUL-terminated UTF-16 strings and remain alive for the call.
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
+}
+
+/// Persist metadata without ever exposing a partially-written JSON file.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = temporary_path(path);
+    let result = (|| {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        output.write_all(contents)?;
+        output.sync_all()?;
+        drop(output);
+        replace_existing(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn copy_replace_with_progress<F>(
@@ -277,58 +408,33 @@ where
         fs::create_dir_all(parent)?;
     }
     let total = source.metadata()?.len();
-    let temp = destination.with_extension("astral-install-tmp");
-    let mut input = fs::File::open(source)?;
-    let mut output = fs::File::create(&temp)?;
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 128 * 1024];
-    progress(0, total);
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let temporary = temporary_path(destination);
+    let result = (|| {
+        let mut input = fs::File::open(source)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 128 * 1024];
+        progress(0, total);
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+            copied += read as u64;
+            progress(copied.min(total), total);
         }
-        output.write_all(&buffer[..read])?;
-        copied += read as u64;
-        progress(copied.min(total), total);
+        output.sync_all()?;
+        drop(output);
+        replace_existing(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    output.sync_all()?;
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
-    fs::rename(&temp, destination)?;
-    Ok(())
-}
-
-fn rollback_install(
-    roots: &InstallRoots,
-    staging_root: &Path,
-    backup_root: &Path,
-    ownership: &OwnershipManifest,
-) {
-    for created in ownership.created_files.iter().rev() {
-        if let Ok(path) = target_path(roots, created.target, &created.path) {
-            let _ = fs::remove_file(path);
-        }
-    }
-    for modified in ownership.modified_files.iter().rev() {
-        let destination = match target_path(roots, modified.target, &modified.path) {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        let previous = match rollback_path(staging_root, modified.target, &modified.path) {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        let restore = if previous.is_file() {
-            previous
-        } else {
-            backup_root.join(&modified.backup_path)
-        };
-        if restore.is_file() {
-            let _ = copy_replace(&restore, &destination);
-        }
-    }
+    result
 }
 
 pub fn install_patch(
@@ -352,7 +458,7 @@ pub fn install_patch_with_progress<F>(
     manifest: &PatchManifest,
     staging_root: &Path,
     roots: &InstallRoots,
-    backup_root: &Path,
+    _backup_root: &Path,
     ownership_path: &Path,
     mut progress: F,
 ) -> Result<InstallSummary, InstallError>
@@ -367,10 +473,20 @@ where
         schema_version: 1,
         patch_version: manifest.patch.version.clone(),
         catalog_hash: manifest.game.catalog_hash.clone(),
+        installed_at: None,
+        root_binding: Some(InstallRootBinding::from_roots(roots)),
         created_files: Vec::new(),
         modified_files: Vec::new(),
     };
 
+    // Validate the entire downloaded payload before changing any game file.
+    for file in &manifest.files {
+        verify_file(
+            &staged_path(staging_root, file.target, &file.path)?,
+            file.size,
+            &file.sha256,
+        )?;
+    }
     let result = (|| {
         for (index, file) in manifest.files.iter().enumerate() {
             let file_index = index + 1;
@@ -388,65 +504,12 @@ where
 
             match file.operation.as_str() {
                 "replace" => {
-                    progress(ApplyProgress {
-                        file_index,
-                        file_count,
-                        path: file.path.clone(),
-                        phase: ApplyPhase::BackingUp,
-                        current: completed_size,
-                        total: total_size,
-                    });
-
-                    let previous_size = destination.metadata()?.len();
-                    let previous_hash = sha256_file(&destination)?;
-                    let backup = backup_path(backup_root, file.target, &file.path)?;
-                    let original_hash = match (&file.source_sha256, file.source_size) {
-                        (Some(source_sha256), Some(source_size)) => {
-                            // 현재 게임 파일은 다른 패치/수정본이어도 허용한다.
-                            // 공식 원본 backup 자체만 Release metadata와 일치하는지 확인한다.
-                            verify_file(&backup, source_size, source_sha256)?;
-
-                            // 현재 파일이 공식 원본과 다를 때만 rollback snapshot을 별도로 보존한다.
-                            // 공식 원본이면 verified backup을 rollback에도 그대로 재사용할 수 있다.
-                            if previous_size != source_size
-                                || previous_hash.as_str() != source_sha256.as_str()
-                            {
-                                let previous =
-                                    rollback_path(staging_root, file.target, &file.path)?;
-                                if let Some(parent) = previous.parent() {
-                                    fs::create_dir_all(parent)?;
-                                }
-                                fs::copy(&destination, &previous)?;
-                                verify_file(&previous, previous_size, &previous_hash)?;
-                            }
-                            source_sha256.clone()
-                        }
-                        (None, None) => {
-                            // 구형 manifest에는 Release 원본 metadata가 없을 수 있다.
-                            // 이 경우 기존 동작대로 현재 파일 자체를 복원 backup으로 사용한다.
-                            if let Some(parent) = backup.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::copy(&destination, &backup)?;
-                            verify_file(&backup, previous_size, &previous_hash)?;
-                            previous_hash
-                        }
-                        _ => {
-                            return Err(InstallError::Protocol(ProtocolError::UnsafePath(
-                                "partial source restore metadata".into(),
-                            )));
-                        }
-                    };
                     ownership.modified_files.push(OwnedModifiedFile {
                         target: file.target,
                         path: file.path.clone(),
-                        original_sha256: original_hash,
+                        original_sha256: file.source_sha256.clone().unwrap_or_default(),
                         patched_sha256: file.sha256.clone(),
-                        backup_path: backup
-                            .strip_prefix(backup_root)
-                            .expect("backup path is below root")
-                            .to_string_lossy()
-                            .replace('\\', "/"),
+                        backup_path: String::new(),
                     });
                 }
                 "create" => {
@@ -484,25 +547,114 @@ where
         if let Some(parent) = ownership_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        ownership.installed_at = Some(chrono::Local::now().to_rfc3339());
         let json = serde_json::to_vec_pretty(&ownership)?;
-        let temp = ownership_path.with_extension("json.tmp");
-        fs::write(&temp, json)?;
-        if ownership_path.exists() {
-            fs::remove_file(ownership_path)?;
-        }
-        fs::rename(temp, ownership_path)?;
+        atomic_write(ownership_path, &json)?;
         Ok::<(), InstallError>(())
     })();
 
-    if let Err(error) = result {
-        rollback_install(roots, staging_root, backup_root, &ownership);
-        return Err(error);
-    }
+    result?;
 
     Ok(InstallSummary {
         created: ownership.created_files.len(),
         modified: ownership.modified_files.len(),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchFileAssessment {
+    pub missing_replace: Vec<String>,
+    pub conflicting_create: Vec<String>,
+    pub matching_files: usize,
+    pub total_files: usize,
+}
+
+pub fn assess_patch_files(
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+) -> Result<PatchFileAssessment, InstallError> {
+    manifest.validate()?;
+    let mut result = PatchFileAssessment {
+        missing_replace: Vec::new(),
+        conflicting_create: Vec::new(),
+        matching_files: 0,
+        total_files: manifest.files.len(),
+    };
+    for file in &manifest.files {
+        let path = target_path(roots, file.target, &file.path)?;
+        let matches = path.is_file()
+            && path.metadata()?.len() == file.size
+            && sha256_file(&path)? == file.sha256;
+        if matches {
+            result.matching_files += 1;
+        }
+        if file.operation == "replace" && !path.is_file() {
+            result.missing_replace.push(file.path.clone());
+        }
+        if file.operation == "create" && path.exists() && !matches {
+            result.conflicting_create.push(file.path.clone());
+        }
+    }
+    Ok(result)
+}
+
+/// Restore verified release originals without backing up any game file.
+pub fn restore_release_files(
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+    staging: &Path,
+) -> Result<RemoveReport, InstallError> {
+    manifest.validate()?;
+    let mut report = RemoveReport {
+        removed: 0,
+        restored: 0,
+        issues: Vec::new(),
+    };
+    for file in &manifest.files {
+        let destination = target_path(roots, file.target, &file.path)?;
+        if file.operation == "replace" {
+            let hash = file
+                .source_sha256
+                .as_ref()
+                .ok_or(InstallError::OwnershipMismatch)?;
+            let size = file.source_size.ok_or(InstallError::OwnershipMismatch)?;
+            verify_file(&staged_path(staging, file.target, &file.path)?, size, hash)?;
+        } else if destination.exists()
+            && (!destination.is_file()
+                || destination.metadata()?.len() != file.size
+                || sha256_file(&destination)? != file.sha256)
+        {
+            report.issues.push(RemoveIssue {
+                target: file.target,
+                path: file.path.clone(),
+                kind: RemoveIssueKind::ModifiedExternally,
+            });
+        }
+    }
+    // Preserve unknown added files without blocking original file restoration.
+    for file in &manifest.files {
+        let destination = target_path(roots, file.target, &file.path)?;
+        if file.operation == "replace" {
+            copy_replace(
+                &staged_path(staging, file.target, &file.path)?,
+                &destination,
+            )?;
+            verify_file(
+                &destination,
+                file.source_size.unwrap(),
+                file.source_sha256.as_ref().unwrap(),
+            )?;
+            report.restored += 1;
+        } else if destination.is_file()
+            && destination.metadata()?.len() == file.size
+            && sha256_file(&destination)? == file.sha256
+        {
+            fs::remove_file(destination)?;
+            report.removed += 1;
+        }
+    }
+    Ok(report)
 }
 
 pub fn installed_patch_change_count(
@@ -769,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn restores_modified_file_and_preserves_external_change() {
+    fn installation_records_timestamp_without_any_local_backup() {
         let temp = tempdir().unwrap();
         let staging = temp.path().join("staging");
         let roots = roots(temp.path());
@@ -803,21 +955,15 @@ mod tests {
         install_patch(&patch, &staging, &roots, &backup, &ownership_path).unwrap();
         let ownership: OwnershipManifest =
             serde_json::from_slice(&fs::read(&ownership_path).unwrap()).unwrap();
-        let report = remove_patch(&ownership, &roots, &backup).unwrap();
-        assert_eq!(report.restored, 1);
-        assert_eq!(fs::read(&destination).unwrap(), b"original");
-
-        install_patch(&patch, &staging, &roots, &backup, &ownership_path).unwrap();
-        fs::write(&destination, b"external-change").unwrap();
-        let ownership: OwnershipManifest =
-            serde_json::from_slice(&fs::read(&ownership_path).unwrap()).unwrap();
-        let report = remove_patch(&ownership, &roots, &backup).unwrap();
-        assert_eq!(report.issues.len(), 1);
-        assert_eq!(fs::read(&destination).unwrap(), b"external-change");
+        assert!(ownership.installed_at.is_some());
+        assert!(ownership.modified_files[0].backup_path.is_empty());
+        assert!(!backup.exists());
+        assert!(!staging.join("rollback").exists());
+        assert_eq!(fs::read(&destination).unwrap(), payload);
     }
 
     #[test]
-    fn release_restore_backup_allows_modified_game_target() {
+    fn release_original_restores_modified_and_missing_target_without_ownership() {
         let temp = tempdir().unwrap();
         let staging = temp.path().join("staging");
         let roots = roots(temp.path());
@@ -855,11 +1001,21 @@ mod tests {
         install_patch(&patch, &staging, &roots, &backup_root, &ownership_path).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"patched");
 
-        let ownership: OwnershipManifest =
-            serde_json::from_slice(&fs::read(&ownership_path).unwrap()).unwrap();
-        let report = remove_patch(&ownership, &roots, &backup_root).unwrap();
+        let report = restore_release_files(&patch, &roots, &backup_root).unwrap();
         assert_eq!(report.restored, 1);
         assert_eq!(fs::read(&destination).unwrap(), b"original");
+        fs::remove_file(&destination).unwrap();
+        fs::remove_file(&ownership_path).unwrap();
+        let report = restore_release_files(&patch, &roots, &backup_root).unwrap();
+        assert_eq!(report.restored, 1);
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        fs::write(&backup, b"corrupt").unwrap();
+        fs::write(&destination, b"retain-on-verification-failure").unwrap();
+        assert!(restore_release_files(&patch, &roots, &backup_root).is_err());
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"retain-on-verification-failure"
+        );
     }
 
     #[test]
@@ -912,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_install_rolls_back_to_pre_patch_modified_state() {
+    fn corrupt_staged_payload_is_rejected_before_any_game_file_changes() {
         let temp = tempdir().unwrap();
         let staging = temp.path().join("staging");
         let roots = roots(temp.path());
@@ -997,6 +1153,8 @@ mod tests {
             schema_version: 1,
             patch_version: "v1".into(),
             catalog_hash: "b".repeat(32),
+            installed_at: None,
+            root_binding: None,
             created_files: vec![
                 OwnedCreatedFile {
                     target: InstallTarget::Addressables,
@@ -1042,6 +1200,8 @@ mod tests {
             schema_version: 1,
             patch_version: "v1".into(),
             catalog_hash: "b".repeat(32),
+            installed_at: None,
+            root_binding: None,
             created_files: vec![],
             modified_files: vec![
                 OwnedModifiedFile {
@@ -1104,6 +1264,8 @@ mod tests {
             schema_version: 1,
             patch_version: "v1".into(),
             catalog_hash: "b".repeat(32),
+            installed_at: None,
+            root_binding: None,
             created_files: vec![OwnedCreatedFile {
                 target: InstallTarget::Addressables,
                 path: "created/__data".into(),
@@ -1135,6 +1297,8 @@ mod tests {
             schema_version: 1,
             patch_version: "v1".into(),
             catalog_hash: "b".repeat(32),
+            installed_at: None,
+            root_binding: None,
             created_files: vec![],
             modified_files: vec![OwnedModifiedFile {
                 target: InstallTarget::GameData,
@@ -1150,5 +1314,54 @@ mod tests {
         assert_eq!(report.restored, 0);
         assert!(report.issues.is_empty());
         assert_eq!(fs::read(&destination).unwrap(), b"original");
+    }
+    #[test]
+    fn assessment_distinguishes_missing_ready_matching_and_conflicting_files() {
+        let temp = tempdir().unwrap();
+        let roots = roots(temp.path());
+        let file = ManifestFile {
+            target: InstallTarget::GameData,
+            path: "test.bin".into(),
+            operation: "replace".into(),
+            download_url: "https://example.test/patch.gz".into(),
+            download_sha256: "d".repeat(64),
+            download_size: 5,
+            compression: "gzip".into(),
+            sha256: format!("{:x}", Sha256::digest(b"patched")),
+            size: 7,
+            source_download_url: None,
+            source_download_sha256: None,
+            source_download_size: None,
+            source_sha256: None,
+            source_size: None,
+        };
+        let mut patch = manifest(file);
+        assert_eq!(
+            assess_patch_files(&patch, &roots).unwrap().missing_replace,
+            vec!["test.bin"]
+        );
+        fs::create_dir_all(&roots.game_data).unwrap();
+        let target = roots.game_data.join("test.bin");
+        fs::write(&target, b"original").unwrap();
+        let ready = assess_patch_files(&patch, &roots).unwrap();
+        assert!(ready.missing_replace.is_empty());
+        assert_eq!(ready.matching_files, 0);
+        fs::write(&target, b"patched").unwrap();
+        assert_eq!(
+            assess_patch_files(&patch, &roots).unwrap().matching_files,
+            1
+        );
+        patch.files[0].operation = "create".into();
+        fs::write(&target, b"unknown").unwrap();
+        assert_eq!(
+            assess_patch_files(&patch, &roots)
+                .unwrap()
+                .conflicting_create,
+            vec!["test.bin"]
+        );
+        // Missing release original metadata fails before touching a modified target.
+        patch.files[0].operation = "replace".into();
+        assert!(restore_release_files(&patch, &roots, temp.path()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unknown");
     }
 }

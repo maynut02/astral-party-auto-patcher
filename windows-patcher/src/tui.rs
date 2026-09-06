@@ -24,8 +24,8 @@ use crate::install::{ApplyPhase, RemoveIssueSummary};
 use crate::logging;
 use crate::service::{
     InstallOutcome, InstallProgress, PatchFileInfo, PatcherPaths, ServiceError,
-    install_latest_compatible_with_progress, install_roots, installed_patch_info,
-    remove_installed_patch, reset_patch_state,
+    install_latest_compatible_with_progress, installed_patch_info, remove_compatible_patch,
+    reset_patch_state,
 };
 use crate::settings::AppSettings;
 use crate::uri::{UriAction, UriRequest};
@@ -326,12 +326,12 @@ impl App {
             .settings
             .installation_for(route)
             .map_err(|error| SteamRemoveError::Other(error.to_string()))?;
-        let roots = install_roots(&game);
-        match remove_installed_patch(&self.paths, &roots, game.route) {
-            Ok(None) => Ok("설치된 패치 기록이 없습니다.".into()),
-            Ok(Some(report)) => Ok(format!(
-                "패치를 제거했습니다. 삭제 {}개, 복구 {}개",
-                report.removed, report.restored
+        match remove_compatible_patch(self.endpoints.patch_release_index, &self.paths, &game) {
+            Ok(report) => Ok(format!(
+                "한글패치를 제거했습니다. 삭제 {}개, 복원 {}개, 변경되어 보존한 파일 {}개",
+                report.removed,
+                report.restored,
+                report.issues.len()
             )),
             Err(ServiceError::ExistingPatchUnsafe(summary)) => {
                 Err(SteamRemoveError::ExistingPatchUnsafe(summary))

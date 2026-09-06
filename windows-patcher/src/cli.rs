@@ -15,21 +15,12 @@ use crate::settings::AppSettings;
 use crate::settings::SettingsError;
 #[cfg(windows)]
 use crate::tui::{self, RemoteEndpoints};
-#[cfg(windows)]
-use crate::updater::{
-    UpdateError, apply_update_and_restart, check_and_launch_update, parse_apply_update_request,
-};
 use crate::uri::UriError;
 #[cfg(windows)]
 use crate::uri::UriRequest;
 
 #[cfg(windows)]
 const FALLBACK_RELEASE_INDEX_URL: &str = "https://raw.githubusercontent.com/maynut02/astral-party-korean-patch/distribution/release-index.json";
-#[cfg(windows)]
-const FALLBACK_PATCHER_INDEX_URL: &str = "https://raw.githubusercontent.com/maynut02/astral-party-auto-patcher/distribution/patcher-index.json";
-#[cfg(windows)]
-const FALLBACK_PATCHER_RELEASE_BASE_URL: &str =
-    "https://github.com/maynut02/astral-party-auto-patcher/releases/download";
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -40,9 +31,6 @@ pub enum CliError {
     Registration(#[from] RegistrationError),
     #[error(transparent)]
     Uri(#[from] UriError),
-    #[cfg(windows)]
-    #[error(transparent)]
-    Update(#[from] UpdateError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("WindowsPatcher supports Windows only")]
@@ -54,20 +42,6 @@ fn release_index_url() -> &'static str {
     option_env!("ASTRAL_PATCH_INDEX_URL")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(FALLBACK_RELEASE_INDEX_URL)
-}
-
-#[cfg(windows)]
-fn patcher_index_url() -> &'static str {
-    option_env!("ASTRAL_PATCHER_INDEX_URL")
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(FALLBACK_PATCHER_INDEX_URL)
-}
-
-#[cfg(windows)]
-fn patcher_release_base_url() -> &'static str {
-    option_env!("ASTRAL_PATCHER_RELEASE_BASE_URL")
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(FALLBACK_PATCHER_RELEASE_BASE_URL)
 }
 
 #[cfg(windows)]
@@ -96,15 +70,6 @@ pub fn run() -> Result<(), CliError> {
     }
 
     let original_args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if let Some(request) = parse_apply_update_request(&original_args)? {
-        logging::info(format!(
-            "applying self update after process {}",
-            request.previous_pid
-        ));
-        apply_update_and_restart(&paths.state_root, request)?;
-        return Ok(());
-    }
-
     let migration = migrate_legacy_state(&paths)?;
     if !migration.moved.is_empty() {
         for item in &migration.moved {
@@ -118,27 +83,6 @@ pub fn run() -> Result<(), CliError> {
             "기존 로컬 상태를 새 저장 구조로 정리했습니다. 이동 {}개",
             migration.moved.len()
         ));
-    }
-
-    match check_and_launch_update(
-        patcher_index_url(),
-        patcher_release_base_url(),
-        &paths.state_root,
-        &original_args,
-    ) {
-        Ok(true) => {
-            logging::info(
-                "verified WindowsPatcher update downloaded; handing off to local updater helper",
-            );
-            return Ok(());
-        }
-        Ok(false) => logging::info("self update check: current version is up to date"),
-        Err(error) => {
-            logging::warn(format!("self update check failed: {error}"));
-            startup_notices.push(format!(
-                "자동 업데이트 확인에 실패해 현재 버전으로 계속합니다: {error}"
-            ));
-        }
     }
 
     let installed_exe = ensure_self_installed_and_registered(&paths.state_root)?;

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -116,6 +117,10 @@ impl ReleaseClient {
             return Err(NetworkError::MetadataTooLarge(MAX_METADATA_BYTES));
         }
         Ok(bytes)
+    }
+
+    pub fn fetch_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, NetworkError> {
+        Ok(serde_json::from_slice(&self.get_metadata(url)?)?)
     }
 
     pub fn fetch_release_index(&self, url: &str) -> Result<ReleaseIndex, NetworkError> {

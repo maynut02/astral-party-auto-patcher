@@ -6,9 +6,10 @@ use thiserror::Error;
 
 use crate::game::{GameInstallation, GameRoute};
 use crate::install::{
-    ApplyPhase, ApplyProgress, InstallError, InstallRoots, InstallSummary, OwnershipManifest,
-    RemoveIssueSummary, RemoveReport, install_patch_with_progress, installed_patch_change_count,
-    remove_patch, validate_patch_targets,
+    ApplyPhase, ApplyProgress, InstallError, InstallRootBinding, InstallRoots, InstallSummary,
+    OwnershipManifest, RemoveIssueSummary, RemoveReport, assess_patch_files, atomic_write,
+    install_patch_with_progress, installed_patch_change_count, restore_release_files,
+    validate_patch_targets,
 };
 use crate::logging;
 use crate::network::{NetworkError, ReleaseClient, StageProgress};
@@ -37,6 +38,10 @@ pub enum ServiceError {
         legacy_path: PathBuf,
         destination: PathBuf,
     },
+    #[error(
+        "patch target list changed; remove the existing Korean patch before installing this release"
+    )]
+    ChangedPatchTargets,
     #[error("manifest is not compatible with the detected game")]
     IncompatibleManifest,
 }
@@ -56,6 +61,18 @@ pub struct RouteStatePaths {
     pub backup_root: PathBuf,
     pub ownership_path: PathBuf,
     pub manifest_path: PathBuf,
+    pub pending_manifest_path: PathBuf,
+}
+
+/// A manifest that is being applied, together with the game roots it targets.
+///
+/// Keeping this context in the pending record makes an interrupted operation safe to resume or
+/// remove after the user points the patcher at another game installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInstallManifest {
+    pub manifest: PatchManifest,
+    pub root_binding: InstallRootBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +117,7 @@ impl PatcherPaths {
             backup_root: root.join("backup"),
             ownership_path: root.join("installed.json"),
             manifest_path: root.join("installed-manifest.json"),
+            pending_manifest_path: root.join("pending-manifest.json"),
             root,
         }
     }
@@ -189,6 +207,8 @@ fn move_legacy_path(
 pub struct InstalledPatchInfo {
     pub patch_version: String,
     pub catalog_hash: String,
+    #[serde(default)]
+    pub installed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,10 +283,68 @@ pub fn load_ownership(path: &Path) -> Result<Option<OwnershipManifest>, ServiceE
     Ok(Some(serde_json::from_slice(&raw)?))
 }
 
+/// Load ownership only when it explicitly belongs to the selected game roots.
+///
+/// Older records do not carry a root binding and therefore are deliberately ignored by mutation
+/// paths.  A caller can still inspect them with [`load_ownership`] and repair them after verifying
+/// the complete current manifest against the selected files.
+pub fn load_ownership_for_roots(
+    path: &Path,
+    roots: &InstallRoots,
+) -> Result<Option<OwnershipManifest>, ServiceError> {
+    Ok(load_ownership(path)?.filter(|ownership| ownership.applies_to(roots)))
+}
+
+/// Upgrade an installation record written before root binding was introduced.
+///
+/// A legacy record is bound to the selected roots only when every recorded patched file still
+/// matches there. This keeps path retargeting safe while preserving update detection for existing
+/// users after upgrading the patcher itself.
+pub fn bind_verified_legacy_ownership_for_roots(
+    path: &Path,
+    roots: &InstallRoots,
+    catalog_hash: &str,
+) -> Result<bool, ServiceError> {
+    let Some(mut ownership) = load_ownership(path)? else {
+        return Ok(false);
+    };
+    if ownership.catalog_hash != catalog_hash
+        || ownership.root_binding.is_some()
+        || (ownership.created_files.is_empty() && ownership.modified_files.is_empty())
+        || installed_patch_change_count(&ownership, roots)? != 0
+    {
+        return Ok(false);
+    }
+
+    ownership.root_binding = Some(InstallRootBinding::from_roots(roots));
+    write_json_atomic(path, &ownership)?;
+    logging::info(format!(
+        "Bound legacy installation record to current roots: {}",
+        path.display()
+    ));
+    Ok(true)
+}
+
+pub fn load_pending_manifest(path: &Path) -> Result<Option<PendingInstallManifest>, ServiceError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read(path)?;
+    let pending = serde_json::from_slice(&raw)?;
+    Ok(Some(pending))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ServiceError> {
+    let json = serde_json::to_vec_pretty(value)?;
+    atomic_write(path, &json)?;
+    Ok(())
+}
+
 pub fn installed_patch_info(path: &Path) -> Result<Option<InstalledPatchInfo>, ServiceError> {
     Ok(load_ownership(path)?.map(|ownership| InstalledPatchInfo {
         patch_version: ownership.patch_version,
         catalog_hash: ownership.catalog_hash,
+        installed_at: ownership.installed_at,
     }))
 }
 
@@ -296,6 +374,9 @@ pub fn reset_patch_state(
     if state.manifest_path.exists() {
         fs::remove_file(&state.manifest_path)?;
     }
+    if state.pending_manifest_path.exists() {
+        fs::remove_file(&state.pending_manifest_path)?;
+    }
 
     Ok(PatchStateResetReport {
         ownership_removed,
@@ -304,141 +385,181 @@ pub fn reset_patch_state(
     })
 }
 
+pub fn remove_compatible_patch(
+    release_index_url: &str,
+    paths: &PatcherPaths,
+    game: &GameInstallation,
+) -> Result<RemoveReport, ServiceError> {
+    let client = ReleaseClient::new(&format!("AstralAutoPatcher/{}", env!("CARGO_PKG_VERSION")))?;
+    let index = client.fetch_release_index(release_index_url)?;
+    let (_, manifest) = client.fetch_compatible_manifest(
+        &index,
+        game.route.as_str(),
+        &game.catalog.version,
+        &game.catalog.hash,
+        RELEASE_CHANNEL,
+    )?;
+    ensure_manifest_compatible(&manifest, game, game.route.as_str())?;
+    let mut restore_manifest = manifest;
+    let state = paths.route_state(game.route);
+    let roots = install_roots(game);
+    // Historical metadata is only used for targets omitted by the current release.
+    // Every original is still downloaded and verified against its release metadata.
+    let ownership_matches = load_ownership_for_roots(&state.ownership_path, &roots)
+        .ok()
+        .flatten()
+        .is_some();
+    if ownership_matches
+        && let Ok(raw) = fs::read(&state.manifest_path)
+        && let Ok(previous) = serde_json::from_slice::<PatchManifest>(&raw)
+        && previous.validate().is_ok()
+        && ensure_manifest_compatible(&previous, game, game.route.as_str()).is_ok()
+    {
+        merge_restore_targets(&mut restore_manifest, &previous, &roots)?;
+    }
+    if let Ok(Some(pending)) = load_pending_manifest(&state.pending_manifest_path)
+        && pending.root_binding.matches_roots(&roots)
+        && pending.manifest.validate().is_ok()
+        && ensure_manifest_compatible(&pending.manifest, game, game.route.as_str()).is_ok()
+    {
+        merge_restore_targets(&mut restore_manifest, &pending.manifest, &roots)?;
+    }
+    remove_release_manifest(&client, paths, &roots, game.route, &restore_manifest)
+}
+
+fn merge_restore_targets(
+    current: &mut PatchManifest,
+    previous: &PatchManifest,
+    roots: &InstallRoots,
+) -> Result<(), InstallError> {
+    for old in &previous.files {
+        if let Some(new) = current
+            .files
+            .iter_mut()
+            .find(|new| new.target == old.target && new.path == old.path)
+        {
+            // A newer create entry has no original metadata; retain the prior
+            // replacement's released original so removal can recover this path.
+            if old.operation == "replace" && new.operation == "create" {
+                *new = old.clone();
+                continue;
+            }
+            // Both releases added this path: recognize an intact older patch too.
+            if old.operation == "create" && new.operation == "create" {
+                let root = match old.target {
+                    crate::protocol::InstallTarget::GameData => &roots.game_data,
+                    crate::protocol::InstallTarget::Addressables => &roots.addressables,
+                };
+                let target = root.join(&old.path);
+                if target.is_file()
+                    && target.metadata()?.len() == old.size
+                    && crate::install::sha256_file(&target)? == old.sha256
+                {
+                    *new = old.clone();
+                }
+            }
+        } else {
+            current.files.push(old.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Compatibility entry point for the terminal UI. Originals are always downloaded anew.
 pub fn remove_installed_patch(
     paths: &PatcherPaths,
     roots: &InstallRoots,
     route: GameRoute,
 ) -> Result<Option<RemoveReport>, ServiceError> {
     let state = paths.route_state(route);
-    let Some(ownership) = load_ownership(&state.ownership_path)? else {
-        logging::info(format!(
-            "Steam remove: route={} no installed state",
-            route.as_str()
-        ));
+    let ownership = load_ownership_for_roots(&state.ownership_path, roots)?;
+    let pending = load_pending_manifest(&state.pending_manifest_path)?
+        .filter(|pending| pending.root_binding.matches_roots(roots))
+        .filter(|pending| pending.manifest.validate().is_ok());
+    // A manifest without an ownership/root binding may describe a different game directory.
+    // Pending records carry their own binding and are safe to use for an interrupted install.
+    if ownership.is_none() && pending.is_none() {
+        return Ok(None);
+    }
+    let mut manifest = if state.manifest_path.is_file() {
+        serde_json::from_slice::<PatchManifest>(&fs::read(&state.manifest_path)?)?
+    } else if let Some(pending) = pending.as_ref() {
+        pending.manifest.clone()
+    } else {
         return Ok(None);
     };
-    logging::info(format!(
-        "Steam remove preflight: route={} patch={} created={} modified={} backup={}",
-        route.as_str(),
-        ownership.patch_version,
-        ownership.created_files.len(),
-        ownership.modified_files.len(),
-        state.backup_root.display()
-    ));
-    repair_restore_backups(&ownership, &state)?;
-    let report = remove_patch(&ownership, roots, &state.backup_root)?;
-    let issues = report.issue_summary();
-    if issues.total() > 0 {
-        for issue in &report.issues {
-            logging::warn(format!(
-                "Steam remove issue: route={} target={:?} path={} kind={:?}",
-                route.as_str(),
-                issue.target,
-                issue.path,
-                issue.kind
-            ));
-        }
-        logging::warn(format!(
-            "Steam remove blocked: route={} summary={issues}",
-            route.as_str()
-        ));
-        return Err(ServiceError::ExistingPatchUnsafe(issues));
-    }
-    if state.ownership_path.exists() {
-        fs::remove_file(&state.ownership_path)?;
-    }
-    if state.backup_root.exists() {
-        fs::remove_dir_all(&state.backup_root)?;
-    }
-    if state.manifest_path.exists() {
-        fs::remove_file(&state.manifest_path)?;
-    }
-    logging::info(format!(
-        "Steam remove complete: route={} removed={} restored={}",
-        route.as_str(),
-        report.removed,
-        report.restored
-    ));
-    Ok(Some(report))
-}
-
-fn repair_restore_backups(
-    ownership: &OwnershipManifest,
-    state: &RouteStatePaths,
-) -> Result<(), ServiceError> {
-    let mut needs_restore = Vec::new();
-    for modified in &ownership.modified_files {
-        let backup = state.backup_root.join(&modified.backup_path);
-        if !backup.is_file() || crate::install::sha256_file(&backup)? != modified.original_sha256 {
-            needs_restore.push(modified);
-        }
-    }
-    if needs_restore.is_empty() || !state.manifest_path.is_file() {
-        return Ok(());
-    }
-    let raw = fs::read(&state.manifest_path)?;
-    let manifest: PatchManifest = serde_json::from_slice(&raw)?;
     manifest.validate().map_err(InstallError::from)?;
-    if manifest.patch.version != ownership.patch_version
-        || manifest.game.catalog_hash != ownership.catalog_hash
+    let catalog_root = roots
+        .addressables
+        .parent()
+        .ok_or(ServiceError::IncompatibleManifest)?;
+    let catalog = crate::game::discover_latest_catalog(catalog_root)?;
+    if manifest.patch.route != route.as_str()
+        || manifest.game.version != catalog.version
+        || manifest.game.catalog_hash != catalog.hash
     {
         return Err(ServiceError::IncompatibleManifest);
     }
-    let user_agent = format!("AstralAutoPatcher/{}", env!("CARGO_PKG_VERSION"));
-    let client = ReleaseClient::new(&user_agent)?;
-    for modified in needs_restore {
-        let Some(file) = manifest
-            .files
-            .iter()
-            .find(|file| file.target == modified.target && file.path == modified.path)
-        else {
-            continue;
-        };
-        if file.source_sha256.as_deref() != Some(modified.original_sha256.as_str()) {
-            continue;
-        }
-        let backup = state.backup_root.join(&modified.backup_path);
-        logging::info(format!(
-            "Steam restore source download: path={}",
-            modified.path
-        ));
-        client.download_original_file(file, &backup)?;
+    if let Some(pending) = pending.as_ref() {
+        merge_restore_targets(&mut manifest, &pending.manifest, roots)?;
     }
-    Ok(())
+    let client = ReleaseClient::new(&format!("AstralAutoPatcher/{}", env!("CARGO_PKG_VERSION")))?;
+    remove_release_manifest(&client, paths, roots, route, &manifest).map(Some)
 }
 
-fn prepare_release_restore_backups(
+fn remove_release_manifest(
     client: &ReleaseClient,
+    paths: &PatcherPaths,
+    roots: &InstallRoots,
+    route: GameRoute,
     manifest: &PatchManifest,
-    state: &RouteStatePaths,
-) -> Result<(), ServiceError> {
+) -> Result<RemoveReport, ServiceError> {
+    let state = paths.route_state(route);
+    state.reset_staging()?;
+    // A fresh staging directory ensures no local originals or stale downloads are reused.
     for file in &manifest.files {
-        if file.operation != "replace" {
-            continue;
+        if file.operation == "replace" {
+            logging::info(format!("Downloading release original: {}", file.path));
+            client.download_original_file(
+                file,
+                &state
+                    .staging_root
+                    .join(file.target.staging_dir())
+                    .join(&file.path),
+            )?;
         }
-        let (Some(source_sha256), Some(source_size)) = (&file.source_sha256, file.source_size)
-        else {
-            continue;
-        };
-        let backup = state
-            .backup_root
-            .join(file.target.staging_dir())
-            .join(&file.path);
-        if backup.is_file()
-            && backup.metadata()?.len() == source_size
-            && crate::install::sha256_file(&backup)? == *source_sha256
-        {
-            continue;
-        }
-        logging::info(format!(
-            "Steam restore source prepare: path={} source={} action={}",
-            file.path,
-            file.source_download_url.as_deref().unwrap_or("missing"),
-            if backup.exists() { "repair" } else { "create" },
-        ));
-        client.download_original_file(file, &backup)?;
     }
-    Ok(())
+    let report = restore_release_files(manifest, roots, &state.staging_root)?;
+    // Keep the journal when any file is externally changed so removal can be retried.  Also do
+    // not clear metadata from a previous game folder after the user retargets the patcher.
+    if report.issues.is_empty() {
+        let ownership_matches = load_ownership_for_roots(&state.ownership_path, roots)
+            .ok()
+            .flatten()
+            .is_some();
+        if ownership_matches {
+            for path in [&state.ownership_path, &state.manifest_path] {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        let pending_matches = load_pending_manifest(&state.pending_manifest_path)
+            .ok()
+            .flatten()
+            .is_some_and(|pending| pending.root_binding.matches_roots(roots));
+        if pending_matches && state.pending_manifest_path.exists() {
+            fs::remove_file(&state.pending_manifest_path)?;
+        }
+    }
+    let _ = fs::remove_dir_all(&state.staging_root);
+    logging::info(format!(
+        "Release restore complete: restored={} removed={} preserved={}",
+        report.restored,
+        report.removed,
+        report.issues.len()
+    ));
+    Ok(report)
 }
 
 fn ensure_manifest_compatible(
@@ -453,6 +574,150 @@ fn ensure_manifest_compatible(
         return Err(ServiceError::IncompatibleManifest);
     }
     Ok(())
+}
+
+fn stage_before_existing_removal<S>(
+    state: &RouteStatePaths,
+    existing: Option<&OwnershipManifest>,
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+    _route: GameRoute,
+    progress: &mut dyn FnMut(InstallProgress),
+    stage: S,
+) -> Result<(), ServiceError>
+where
+    S: FnOnce(&Path, &mut dyn FnMut(InstallProgress)) -> Result<(), ServiceError>,
+{
+    // Keep the currently installed patch intact until every new transport file has been
+    // downloaded, decompressed, and verified in staging.
+    state.reset_staging()?;
+    stage(&state.staging_root, progress)?;
+
+    if let Some(existing) = existing.filter(|record| record.applies_to(roots)) {
+        // Only delete an old added file if its contents still match the recorded patch.
+        let mut created = Vec::new();
+        for file in &existing.created_files {
+            if manifest.files.iter().any(|new| {
+                new.target == file.target
+                    && new.path == file.path
+                    && (new.operation == "replace" || new.sha256 == file.installed_sha256)
+            }) {
+                continue;
+            }
+            crate::protocol::validate_relative_path(&file.path).map_err(InstallError::from)?;
+            let root = match file.target {
+                crate::protocol::InstallTarget::GameData => &roots.game_data,
+                crate::protocol::InstallTarget::Addressables => &roots.addressables,
+            };
+            let path = root.join(&file.path);
+            if path.is_file() && crate::install::sha256_file(&path)? == file.installed_sha256 {
+                created.push(path);
+            }
+        }
+        for path in created {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn ownership_for_manifest(
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+    installed_at: Option<String>,
+) -> OwnershipManifest {
+    let mut ownership = OwnershipManifest {
+        schema_version: 1,
+        patch_version: manifest.patch.version.clone(),
+        catalog_hash: manifest.game.catalog_hash.clone(),
+        installed_at,
+        root_binding: Some(InstallRootBinding::from_roots(roots)),
+        created_files: Vec::new(),
+        modified_files: Vec::new(),
+    };
+    for file in &manifest.files {
+        match file.operation.as_str() {
+            "create" => ownership
+                .created_files
+                .push(crate::install::OwnedCreatedFile {
+                    target: file.target,
+                    path: file.path.clone(),
+                    installed_sha256: file.sha256.clone(),
+                }),
+            "replace" => ownership
+                .modified_files
+                .push(crate::install::OwnedModifiedFile {
+                    target: file.target,
+                    path: file.path.clone(),
+                    original_sha256: file.source_sha256.clone().unwrap_or_default(),
+                    patched_sha256: file.sha256.clone(),
+                    backup_path: String::new(),
+                }),
+            _ => unreachable!("manifest validation rejects unsupported operations"),
+        }
+    }
+    ownership
+}
+
+/// Reconcile a fully verified install after an interrupted operation.
+///
+/// The pending journal is required so a background verification cannot manufacture an install
+/// record merely because files happen to have the same hashes as a release.  The regular install
+/// path uses the same implementation without that requirement when it has just resolved a
+/// release itself.
+pub fn reconcile_verified_install(
+    paths: &PatcherPaths,
+    game: &GameInstallation,
+    manifest: &PatchManifest,
+) -> Result<bool, ServiceError> {
+    reconcile_verified_manifest(paths, game, manifest, true)
+}
+
+fn reconcile_verified_manifest(
+    paths: &PatcherPaths,
+    game: &GameInstallation,
+    manifest: &PatchManifest,
+    require_pending: bool,
+) -> Result<bool, ServiceError> {
+    manifest.validate().map_err(InstallError::from)?;
+    ensure_manifest_compatible(manifest, game, game.route.as_str())?;
+    let roots = install_roots(game);
+    let state = paths.route_state(game.route);
+    let pending = load_pending_manifest(&state.pending_manifest_path)?
+        .filter(|pending| pending.root_binding.matches_roots(&roots))
+        .filter(|pending| {
+            pending.manifest.validate().is_ok()
+                && pending.manifest.patch.version == manifest.patch.version
+                && pending.manifest.game.catalog_hash == manifest.game.catalog_hash
+        });
+    if require_pending && pending.is_none() {
+        return Ok(false);
+    }
+    let assessment = assess_patch_files(manifest, &roots)?;
+    if assessment.total_files == 0 || assessment.matching_files != assessment.total_files {
+        return Ok(false);
+    }
+    let existing = load_ownership_for_roots(&state.ownership_path, &roots)
+        .ok()
+        .flatten();
+    let installed_at = existing
+        .as_ref()
+        .filter(|old| {
+            old.patch_version == manifest.patch.version
+                && old.catalog_hash == manifest.game.catalog_hash
+        })
+        .and_then(|old| old.installed_at.clone());
+    let ownership = ownership_for_manifest(manifest, &roots, installed_at);
+    write_json_atomic(&state.ownership_path, &ownership)?;
+    write_json_atomic(&state.manifest_path, manifest)?;
+    if pending.is_some()
+        && let Err(error) = fs::remove_file(&state.pending_manifest_path)
+    {
+        logging::warn(format!(
+            "verified install metadata repaired but pending journal cleanup failed: {error}"
+        ));
+    }
+    Ok(true)
 }
 
 pub fn install_latest_compatible(
@@ -520,64 +785,150 @@ where
         install_total,
     });
 
-    if let Some(existing) = load_ownership(&state.ownership_path)? {
-        if existing.patch_version == manifest.patch.version
-            && existing.catalog_hash == manifest.game.catalog_hash
-        {
-            let changed_files = installed_patch_change_count(&existing, &roots)?;
-            if changed_files > 0 {
-                logging::warn(format!(
-                    "Steam installed state differs from files: route={} changed={changed_files}",
-                    route
-                ));
-                return Err(ServiceError::ExistingPatchChanged(changed_files));
-            }
-            return Ok(InstallOutcome::AlreadyInstalled(InstalledPatchInfo {
-                patch_version: existing.patch_version,
-                catalog_hash: existing.catalog_hash,
-            }));
+    let existing = match load_ownership_for_roots(&state.ownership_path, &roots) {
+        Ok(value) => value,
+        Err(error) => {
+            logging::warn(format!("Ignoring unreadable installation record: {error}"));
+            None
         }
-        progress(InstallProgress::RemovingExisting {
-            patch_version: existing.patch_version.clone(),
-        });
-        remove_installed_patch(paths, &roots, game.route)?;
+    };
+    if existing
+        .as_ref()
+        .filter(|old| old.catalog_hash == manifest.game.catalog_hash)
+        .is_some_and(|old| {
+            old.modified_files.iter().any(|file| {
+                !manifest.files.iter().any(|new| {
+                    new.target == file.target && new.path == file.path && new.operation == "replace"
+                })
+            })
+        })
+    {
+        return Err(ServiceError::ChangedPatchTargets);
+    }
+    let assessment = assess_patch_files(&manifest, &roots)?;
+    if assessment.total_files > 0 && assessment.matching_files == assessment.total_files {
+        // A previous process may have applied every file and failed before promoting metadata.
+        // Rebuild the record from the verified manifest, preserving a timestamp only when it is
+        // known to belong to this exact patch and root binding.
+        let installed_at = existing
+            .as_ref()
+            .filter(|old| {
+                old.patch_version == manifest.patch.version
+                    && old.catalog_hash == manifest.game.catalog_hash
+            })
+            .and_then(|old| old.installed_at.clone());
+        let ownership = ownership_for_manifest(&manifest, &roots, installed_at.clone());
+        write_json_atomic(&state.ownership_path, &ownership)?;
+        write_json_atomic(&state.manifest_path, &manifest)?;
+        if let Ok(Some(pending)) = load_pending_manifest(&state.pending_manifest_path)
+            && pending.root_binding.matches_roots(&roots)
+            && let Err(error) = fs::remove_file(&state.pending_manifest_path)
+        {
+            logging::warn(format!(
+                "installed files verified but pending journal cleanup failed: {error}"
+            ));
+        }
+        return Ok(InstallOutcome::AlreadyInstalled(InstalledPatchInfo {
+            patch_version: manifest.patch.version.clone(),
+            catalog_hash: manifest.game.catalog_hash.clone(),
+            installed_at,
+        }));
+    }
+    for file in &manifest.files {
+        let root = match file.target {
+            crate::protocol::InstallTarget::GameData => &roots.game_data,
+            crate::protocol::InstallTarget::Addressables => &roots.addressables,
+        };
+        let target = root.join(&file.path);
+        if file.operation == "replace" && !target.is_file() {
+            return Err(InstallError::ReplaceTargetMissing(target).into());
+        }
+        if assessment.conflicting_create.contains(&file.path) {
+            let known = existing
+                .as_ref()
+                .filter(|old| old.catalog_hash == manifest.game.catalog_hash)
+                .is_some_and(|old| {
+                    old.created_files.iter().any(|created| {
+                        created.target == file.target
+                            && created.path == file.path
+                            && target.is_file()
+                            && crate::install::sha256_file(&target).ok().as_deref()
+                                == Some(created.installed_sha256.as_str())
+                    })
+                });
+            if !known {
+                return Err(InstallError::CreateTargetExists(target).into());
+            }
+        }
     }
 
-    validate_patch_targets(&manifest, &roots)?;
-    state.reset_staging()?;
-    prepare_release_restore_backups(&client, &manifest, &state)?;
-    client.stage_manifest_files_with_progress(
+    // This is the operation journal.  It must be durable before any game file is retired or
+    // replaced, and it intentionally remains in place when staging or installation fails.
+    let pending = PendingInstallManifest {
+        manifest: manifest.clone(),
+        root_binding: InstallRootBinding::from_roots(&roots),
+    };
+    write_json_atomic(&state.pending_manifest_path, &pending)?;
+
+    if existing.is_some() {
+        progress(InstallProgress::RemovingExisting {
+            patch_version: existing
+                .as_ref()
+                .map(|old| old.patch_version.clone())
+                .unwrap_or_default(),
+        });
+    }
+    stage_before_existing_removal(
+        &state,
+        existing
+            .as_ref()
+            .filter(|old| old.catalog_hash == manifest.game.catalog_hash),
         &manifest,
-        &state.staging_root,
-        |event| match event {
-            StageProgress::Downloading {
-                file_index,
-                file_count,
-                file_name,
-                current,
-                total,
-            } => progress(InstallProgress::Downloading {
-                file_index,
-                file_count,
-                file_name,
-                current,
-                total,
-            }),
-            StageProgress::Extracting {
-                file_index,
-                file_count,
-                file_name,
-                current,
-                total,
-            } => progress(InstallProgress::Extracting {
-                file_index,
-                file_count,
-                file_name,
-                current,
-                total,
-            }),
+        &roots,
+        game.route,
+        &mut progress,
+        |staging_root, progress| {
+            client.stage_manifest_files_with_progress(
+                &manifest,
+                staging_root,
+                |event| match event {
+                    StageProgress::Downloading {
+                        file_index,
+                        file_count,
+                        file_name,
+                        current,
+                        total,
+                    } => progress(InstallProgress::Downloading {
+                        file_index,
+                        file_count,
+                        file_name,
+                        current,
+                        total,
+                    }),
+                    StageProgress::Extracting {
+                        file_index,
+                        file_count,
+                        file_name,
+                        current,
+                        total,
+                    } => progress(InstallProgress::Extracting {
+                        file_index,
+                        file_count,
+                        file_name,
+                        current,
+                        total,
+                    }),
+                },
+            )?;
+            Ok(())
         },
     )?;
+
+    // Check again after retiring known files added by the previous patch.
+    if existing.is_some() {
+        validate_patch_targets(&manifest, &roots)?;
+    }
+
     let summary = install_patch_with_progress(
         &manifest,
         &state.staging_root,
@@ -602,16 +953,12 @@ where
             });
         },
     )?;
-    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-    let manifest_temp = state.manifest_path.with_extension("json.tmp");
-    if let Some(parent) = state.manifest_path.parent() {
-        fs::create_dir_all(parent)?;
+    write_json_atomic(&state.manifest_path, &manifest)?;
+    if let Err(error) = fs::remove_file(&state.pending_manifest_path) {
+        logging::warn(format!(
+            "patch installed but pending journal cleanup failed: {error}"
+        ));
     }
-    fs::write(&manifest_temp, manifest_json)?;
-    if state.manifest_path.exists() {
-        fs::remove_file(&state.manifest_path)?;
-    }
-    fs::rename(manifest_temp, &state.manifest_path)?;
     let _ = fs::remove_dir_all(&state.staging_root);
     logging::info(format!(
         "Steam install complete: route={} patch={} created={} modified={}",
@@ -634,7 +981,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::install::install_patch;
+    use crate::install::{install_patch, installed_patch_change_count};
     use crate::protocol::{InstallTarget, ManifestFile, PatchManifest, PatchMetadata, TargetGame};
 
     #[test]
@@ -680,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_removes_old_patch_before_new_install() {
+    fn upgrade_overwrites_patch_without_original_backup() {
         let temp = tempdir().unwrap();
         let paths = PatcherPaths::below(temp.path().join("state"));
         let roots = InstallRoots {
@@ -706,15 +1053,87 @@ mod tests {
         )
         .unwrap();
 
-        let report = remove_installed_patch(&paths, &roots, GameRoute::IntSteam)
+        let ownership = installed_patch_info(&state.ownership_path)
             .unwrap()
             .unwrap();
-        assert_eq!(report.restored, 1);
+        assert_eq!(ownership.patch_version, "v1");
+        assert!(ownership.installed_at.is_some());
+        assert!(!state.backup_root.exists());
+        fs::write(&stage, b"patch02").unwrap();
+        let next = manifest("v2", &format!("{:x}", Sha256::digest(b"patch02")));
+        install_patch(
+            &next,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
         assert_eq!(
             fs::read(roots.game_data.join("data.unity3d")).unwrap(),
-            b"original"
+            b"patch02"
         );
-        assert!(!state.ownership_path.exists());
+        assert_eq!(
+            installed_patch_info(&state.ownership_path)
+                .unwrap()
+                .unwrap()
+                .patch_version,
+            "v2"
+        );
+        assert!(!state.backup_root.exists());
+    }
+
+    #[test]
+    fn staging_failure_preserves_existing_installed_patch() {
+        let temp = tempdir().unwrap();
+        let paths = PatcherPaths::below(temp.path().join("state"));
+        let roots = InstallRoots {
+            addressables: temp.path().join("addressables"),
+            game_data: temp.path().join("game-data"),
+        };
+        fs::create_dir_all(&roots.game_data).unwrap();
+        let target = roots.game_data.join("data.unity3d");
+        fs::write(&target, b"original").unwrap();
+
+        let old_payload = b"patch01";
+        let old_manifest = manifest("v1", &format!("{:x}", Sha256::digest(old_payload)));
+        let state = paths.route_state(GameRoute::IntSteam);
+        let old_stage = state.staging_root.join("game-data/data.unity3d");
+        fs::create_dir_all(old_stage.parent().unwrap()).unwrap();
+        fs::write(&old_stage, old_payload).unwrap();
+        install_patch(
+            &old_manifest,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
+        let old_ownership = fs::read(&state.ownership_path).unwrap();
+        let old_ownership_manifest = load_ownership(&state.ownership_path).unwrap().unwrap();
+
+        let mut events = Vec::new();
+        let error = stage_before_existing_removal(
+            &state,
+            Some(&old_ownership_manifest),
+            &old_manifest,
+            &roots,
+            GameRoute::IntSteam,
+            &mut |event| events.push(event),
+            |_staging_root, _progress| {
+                Err(ServiceError::Network(NetworkError::NoCompatibleRelease))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServiceError::Network(NetworkError::NoCompatibleRelease)
+        ));
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&target).unwrap(), old_payload);
+        assert_eq!(fs::read(&state.ownership_path).unwrap(), old_ownership);
+        assert!(!state.backup_root.exists());
     }
 
     #[test]
@@ -797,6 +1216,73 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ownership_is_bound_only_after_current_files_are_verified() {
+        let temp = tempdir().unwrap();
+        let paths = PatcherPaths::below(temp.path().join("state"));
+        let roots = InstallRoots {
+            addressables: temp.path().join("addressables"),
+            game_data: temp.path().join("game-data"),
+        };
+        fs::create_dir_all(&roots.game_data).unwrap();
+        fs::write(roots.game_data.join("data.unity3d"), b"original").unwrap();
+
+        let payload = b"patch01";
+        let hash = format!("{:x}", Sha256::digest(payload));
+        let current = manifest("v1", &hash);
+        let state = paths.route_state(GameRoute::IntSteam);
+        let stage = state.staging_root.join("game-data/data.unity3d");
+        fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        fs::write(&stage, payload).unwrap();
+        install_patch(
+            &current,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
+
+        let mut legacy = load_ownership(&state.ownership_path).unwrap().unwrap();
+        legacy.root_binding = None;
+        write_json_atomic(&state.ownership_path, &legacy).unwrap();
+        assert!(
+            load_ownership_for_roots(&state.ownership_path, &roots)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bind_verified_legacy_ownership_for_roots(
+                &state.ownership_path,
+                &roots,
+                &current.game.catalog_hash,
+            )
+            .unwrap()
+        );
+        assert!(
+            load_ownership_for_roots(&state.ownership_path, &roots)
+                .unwrap()
+                .is_some()
+        );
+
+        legacy.root_binding = None;
+        write_json_atomic(&state.ownership_path, &legacy).unwrap();
+        fs::write(roots.game_data.join("data.unity3d"), b"changed").unwrap();
+        assert!(
+            !bind_verified_legacy_ownership_for_roots(
+                &state.ownership_path,
+                &roots,
+                &current.game.catalog_hash,
+            )
+            .unwrap()
+        );
+        assert!(
+            load_ownership_for_roots(&state.ownership_path, &roots)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn restored_game_file_is_detected_as_changed_patch_state() {
         let temp = tempdir().unwrap();
         let paths = PatcherPaths::below(temp.path().join("state"));
@@ -861,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn external_changes_block_automatic_upgrade() {
+    fn modified_replace_target_can_be_repaired_without_backup() {
         let temp = tempdir().unwrap();
         let paths = PatcherPaths::below(temp.path().join("state"));
         let roots = InstallRoots {
@@ -888,14 +1374,148 @@ mod tests {
         .unwrap();
         fs::write(roots.game_data.join("data.unity3d"), b"changed").unwrap();
 
-        let err = remove_installed_patch(&paths, &roots, GameRoute::IntSteam).unwrap_err();
-        assert!(matches!(
-            err,
-            ServiceError::ExistingPatchUnsafe(RemoveIssueSummary {
-                modified_externally: 1,
-                ..
-            })
-        ));
-        assert!(state.ownership_path.exists());
+        install_patch(
+            &first,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(roots.game_data.join("data.unity3d")).unwrap(),
+            payload
+        );
+        assert!(!state.backup_root.exists());
+    }
+    #[test]
+    fn upgrading_create_to_replace_keeps_required_target() {
+        let temp = tempdir().unwrap();
+        let paths = PatcherPaths::below(temp.path().join("state"));
+        let state = paths.route_state(GameRoute::IntSteam);
+        let roots = InstallRoots {
+            game_data: temp.path().join("game"),
+            addressables: temp.path().join("bundles"),
+        };
+        let old_hash = format!("{:x}", Sha256::digest(b"patch01"));
+        let mut old = manifest("v1", &old_hash);
+        old.files[0].operation = "create".into();
+        let stage = state.staging_root.join("game-data/data.unity3d");
+        fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        fs::write(&stage, b"patch01").unwrap();
+        install_patch(
+            &old,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
+        let ownership = load_ownership(&state.ownership_path).unwrap().unwrap();
+        let next = manifest("v2", &format!("{:x}", Sha256::digest(b"patch02")));
+        stage_before_existing_removal(
+            &state,
+            Some(&ownership),
+            &next,
+            &roots,
+            GameRoute::IntSteam,
+            &mut |_| {},
+            |staging, _| {
+                let staged = staging.join("game-data/data.unity3d");
+                fs::create_dir_all(staged.parent().unwrap())?;
+                fs::write(staged, b"patch02")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(roots.game_data.join("data.unity3d")).unwrap(),
+            b"patch01"
+        );
+        install_patch(
+            &next,
+            &state.staging_root,
+            &roots,
+            &state.backup_root,
+            &state.ownership_path,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(roots.game_data.join("data.unity3d")).unwrap(),
+            b"patch02"
+        );
+        assert!(!state.backup_root.exists());
+    }
+
+    #[test]
+    fn removal_union_keeps_fresh_metadata_and_obsolete_targets() {
+        let mut current = manifest("v2", &"c".repeat(64));
+        let mut previous = manifest("v1", &"d".repeat(64));
+        let mut obsolete = previous.files[0].clone();
+        obsolete.path = "retired.bin".into();
+        previous.files.push(obsolete);
+        let temp = tempdir().unwrap();
+        let roots = InstallRoots {
+            game_data: temp.path().join("game"),
+            addressables: temp.path().join("bundles"),
+        };
+        merge_restore_targets(&mut current, &previous, &roots).unwrap();
+        assert_eq!(current.files.len(), 2);
+        assert_eq!(current.files[0].sha256, "c".repeat(64));
+        assert_eq!(current.files[1].path, "retired.bin");
+    }
+    #[test]
+    fn removal_recognizes_old_added_file_and_preserves_unknown_change() {
+        let temp = tempdir().unwrap();
+        let roots = InstallRoots {
+            game_data: temp.path().join("game"),
+            addressables: temp.path().join("bundles"),
+        };
+        fs::create_dir_all(&roots.game_data).unwrap();
+        let path = roots.game_data.join("data.unity3d");
+        let mut old = manifest("v1", &format!("{:x}", Sha256::digest(b"patch01")));
+        old.files[0].operation = "create".into();
+        let mut current = manifest("v2", &format!("{:x}", Sha256::digest(b"patch02")));
+        current.files[0].operation = "create".into();
+        fs::write(&path, b"patch01").unwrap();
+        let mut merged = current.clone();
+        merge_restore_targets(&mut merged, &old, &roots).unwrap();
+        let report = restore_release_files(&merged, &roots, temp.path()).unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!path.exists());
+        fs::write(&path, b"unknown").unwrap();
+        merge_restore_targets(&mut current, &old, &roots).unwrap();
+        let report = restore_release_files(&current, &roots, temp.path()).unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"unknown");
+    }
+    #[test]
+    fn removal_restores_previous_replace_when_current_release_creates_that_path() {
+        let temp = tempdir().unwrap();
+        let roots = InstallRoots {
+            game_data: temp.path().join("game"),
+            addressables: temp.path().join("bundles"),
+        };
+        fs::create_dir_all(&roots.game_data).unwrap();
+        let target = roots.game_data.join("data.unity3d");
+        fs::write(&target, b"patch01").unwrap();
+        let mut old = manifest("v1", &format!("{:x}", Sha256::digest(b"patch01")));
+        old.files[0].source_download_url = Some("https://example.test/original.gz".into());
+        old.files[0].source_download_sha256 = Some("a".repeat(64));
+        old.files[0].source_download_size = Some(5);
+        old.files[0].source_sha256 = Some(format!("{:x}", Sha256::digest(b"original")));
+        old.files[0].source_size = Some(8);
+        let mut current = manifest("v2", &format!("{:x}", Sha256::digest(b"patch02")));
+        current.files[0].operation = "create".into();
+        merge_restore_targets(&mut current, &old, &roots).unwrap();
+        assert_eq!(current.files[0].operation, "replace");
+        let staging = temp.path().join("release-originals");
+        fs::create_dir_all(staging.join("game-data")).unwrap();
+        fs::write(staging.join("game-data/data.unity3d"), b"original").unwrap();
+        let report = restore_release_files(&current, &roots, &staging).unwrap();
+        assert_eq!(report.restored, 1);
+        assert!(report.issues.is_empty());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
     }
 }

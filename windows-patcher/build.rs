@@ -101,6 +101,9 @@ fn version_number(version: &str) -> u64 {
 
 #[cfg(windows)]
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_TERMINAL").is_none() {
+        return;
+    }
     use winres::{VersionInfo, WindowsResource};
 
     let manifest_dir =
