@@ -1,0 +1,7 @@
+Third-party runtime
+
+BepInEx 6.0.0-be.788+5b766a3
+https://github.com/BepInEx/BepInEx
+License: LGPL-2.1
+
+The release package is assembled from the official BepInEx Unity IL2CPP Windows x64 artifact without modifying its runtime binaries. Astral Party-specific changes are limited to the bundled BepInEx configuration and the Korean patch preloader/plugin files.

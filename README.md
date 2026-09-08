@@ -1,24 +1,36 @@
 # Astral Party Auto Patcher
 
-Astral Party 한국어 패치를 설치하는 Windows/Android 클라이언트와 Android 원본 게임 APK 배포 자동화를 관리합니다.
+Astral Party 한국어 패치의 Windows BepInEx 플러그인, 기존 Windows 패처, Android 클라이언트와 Android 원본 게임 APK 배포 자동화를 관리합니다.
 
 ## 구성
 
-- `windows-patcher/` — Windows Steam 글로벌/중국판 패치 설치·제거 클라이언트
+- `windows-plugin/` — 현재 Windows Steam INT/CN용 BepInEx Preloader/Plugin과 배포 ZIP 빌드 ([빌드 안내](windows-plugin/README.md))
+- `windows-patcher/` — 기존 WindowsPatcher. 마지막 배포 버전을 보존하며 신규 기능 개발은 하지 않습니다.
 - `android-patcher/` — Android INT/CN 패치 설치·복원 및 INT 원본 게임 설치 클라이언트
-- `.github/workflows/windows-patcher.yml` — WindowsPatcher 릴리즈
+- `.github/workflows/windows-plugin.yml` — Windows Plugin ZIP 릴리즈
+- `.github/legacy-workflows/windows-patcher.yml` — 기존 WindowsPatcher 릴리즈 workflow 보존(실행 비활성화)
 - `.github/workflows/android-patcher.yml` — AndroidPatcher 릴리즈
 - `.github/workflows/android-game-original.yml` — Google Play 원본 split APK 릴리즈
 - `distribution` branch
-  - `patcher-index.json` — WindowsPatcher 업데이트
+  - `patcher-index.json` — 기존 WindowsPatcher 업데이트
   - `mobile-patcher-index.json` — AndroidPatcher 업데이트
   - `android-game-index.json` — 원본 Android 게임 APK
 
-패치 manifest와 패치 파일은 별도 저장소 `maynut02/astral-party-korean-patch`에서 관리합니다. 두 Patcher는 해당 저장소의 `distribution/release-index.json`을 읽어 현재 게임에 맞는 한국어 패치를 찾습니다.
+패치 manifest와 패치 리소스는 별도 저장소 `maynut02/astral-party-korean-patch`에서 관리합니다. 새 Windows Plugin은 게임 실행 시 해당 저장소의 GitHub Release를 확인하며, 기존 WindowsPatcher와 AndroidPatcher는 기존 배포 프로토콜을 유지합니다.
 
 ## 개발
 
-### WindowsPatcher
+### Windows Plugin
+
+Windows Plugin은 공식 BepInEx 6 IL2CPP 패키지와 Unity base libraries를 빌드 시 받아 SHA-256을 검증한 뒤, Preloader/Plugin을 컴파일하고 최종 ZIP을 조립합니다. 실제 게임 설치본이나 `BepInEx/interop`는 빌드에 필요하지 않습니다.
+
+```powershell
+./windows-plugin/scripts/build-package.ps1 -Version 1.0.0
+```
+
+CI와 릴리즈 workflow는 `ubuntu-latest`에서 동일한 빌드를 수행합니다.
+
+### WindowsPatcher (legacy)
 
 ```bash
 cd windows-patcher

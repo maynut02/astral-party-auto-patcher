@@ -7,6 +7,12 @@ __pycache__/
 # Rust
 windows-patcher/target/
 
+# Windows Plugin
+windows-plugin/.work/
+windows-plugin/dist/
+windows-plugin/src/**/bin/
+windows-plugin/src/**/obj/
+
 # Android / Gradle
 .gradle/
 **/build/

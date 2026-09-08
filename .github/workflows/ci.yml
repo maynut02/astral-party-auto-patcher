@@ -9,19 +9,16 @@ permissions:
   contents: read
 
 jobs:
-  windows-patcher:
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: windows-patcher
+  windows-plugin:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v5
         with:
-          components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo test --locked --all-targets --all-features
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+          dotnet-version: 6.0.x
+      - name: Build Windows plugin package
+        shell: pwsh
+        run: ./windows-plugin/scripts/build-package.ps1 -Version 0.0.0
 
   android-patcher:
     runs-on: ubuntu-latest

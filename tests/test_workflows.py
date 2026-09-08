@@ -9,13 +9,31 @@ def _text(name: str) -> str:
     return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
 
 
-def test_windows_release_reads_patch_index_from_patch_repo() -> None:
-    text = _text("windows-patcher.yml")
+def test_windows_patcher_release_workflow_is_archived() -> None:
+    active = ROOT / ".github/workflows/windows-patcher.yml"
+    archived = ROOT / ".github/legacy-workflows/windows-patcher.yml"
+    assert not active.exists()
+    assert archived.is_file()
+
+    text = archived.read_text(encoding="utf-8")
     assert "maynut02/astral-party-korean-patch/distribution/release-index.json" in text
-    assert "distribution/patcher-index.json" in text
+    assert "--path patcher-index.json" in text
     assert "windows-patcher-v" in text
     assert "gh release view patcher-index" not in text
     assert "gh release upload patcher-index" not in text
+
+
+def test_windows_plugin_release_uses_version_bump() -> None:
+    text = _text("windows-plugin.yml")
+    assert "description: Version bump" in text
+    assert "- patch" in text
+    assert "- minor" in text
+    assert "- major" in text
+    assert "Resolve next Windows Plugin version" in text
+    assert "^windows-plugin-v" in text
+    assert "No existing Windows Plugin release found; starting at 1.0.0." in text
+    assert "steps.version.outputs.version" in text
+    assert "steps.version.outputs.tag" in text
 
 
 def test_android_release_owns_mobile_index() -> None:

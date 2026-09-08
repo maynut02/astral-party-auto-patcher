@@ -1,0 +1,151 @@
+name: Windows Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: windows-plugin-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 6.0.x
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Resolve next Windows Plugin version
+        id: version
+        shell: pwsh
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $versions = gh release list --limit 1000 --json tagName --jq '.[].tagName' |
+            ForEach-Object {
+              if ($_ -match '^windows-plugin-v(\d+)\.(\d+)\.(\d+)$') {
+                [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+              }
+            }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to read existing Windows Plugin releases.'
+          }
+
+          $candidates = @($versions)
+          if ($candidates.Count -eq 0) {
+            $version = '1.0.0'
+            Write-Host 'No existing Windows Plugin release found; starting at 1.0.0.'
+          } else {
+            $current = $candidates | Sort-Object -Descending | Select-Object -First 1
+            switch ($env:BUMP) {
+              'patch' { $next = [version]::new($current.Major, $current.Minor, $current.Build + 1) }
+              'minor' { $next = [version]::new($current.Major, $current.Minor + 1, 0) }
+              'major' { $next = [version]::new($current.Major + 1, 0, 0) }
+              default { throw "Unsupported version bump: $env:BUMP" }
+            }
+            $version = $next.ToString(3)
+            Write-Host "Windows Plugin version: $current -> $version ($env:BUMP)"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=windows-plugin-v$version" >> $env:GITHUB_OUTPUT
+          "PACKAGE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Run tooling tests
+        run: |
+          python -m pip install pytest pyyaml
+          python -m pytest tests
+
+      - name: Build Windows plugin package
+        shell: pwsh
+        run: ./windows-plugin/scripts/build-package.ps1 -Version $env:PACKAGE_VERSION
+
+      - name: Verify package metadata
+        shell: pwsh
+        run: |
+          $metadata = Get-Content 'windows-plugin/dist/windows-plugin-build.json' -Raw | ConvertFrom-Json
+          if ($metadata.packageVersion -ne $env:PACKAGE_VERSION) {
+            throw "Package metadata version mismatch: $($metadata.packageVersion)"
+          }
+          $package = Join-Path 'windows-plugin/dist' $metadata.package.file
+          if (!(Test-Path -LiteralPath $package)) { throw "Package not found: $package" }
+          $actual = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $metadata.package.sha256) { throw 'Package SHA-256 verification failed.' }
+          Write-Host "Preloader $($metadata.preloader.version)"
+          Write-Host "Plugin $($metadata.plugin.version)"
+          Write-Host "Package SHA-256 $actual"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AstralPartyKoreanPatch-Windows-v${{ steps.version.outputs.version }}
+          path: |
+            windows-plugin/dist/AstralPartyKoreanPatch-Windows-v${{ steps.version.outputs.version }}.zip
+            windows-plugin/dist/windows-plugin-build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish immutable release
+        shell: pwsh
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:TAG already exists; Windows Plugin releases are immutable."
+          }
+          git ls-remote --exit-code --tags origin "refs/tags/$env:TAG" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Tag $env:TAG already exists; Windows Plugin release tags are immutable."
+          }
+
+          $metadata = Get-Content 'windows-plugin/dist/windows-plugin-build.json' -Raw | ConvertFrom-Json
+          $package = Join-Path 'windows-plugin/dist' $metadata.package.file
+          $notes = @(
+            "Astral Party Windows Korean Patch v$env:PACKAGE_VERSION",
+            '',
+            "- BepInEx: $($metadata.bepinexVersion)",
+            "- Preloader: $($metadata.preloader.version)",
+            "- Plugin: $($metadata.plugin.version)",
+            "- SHA-256: $($metadata.package.sha256)",
+            '',
+            '압축파일의 내용을 8vJXnINT 또는 8vJXn6CN 게임 폴더에 그대로 넣은 뒤 Steam에서 게임을 실행하세요.'
+          ) -join "`n"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'windows-plugin-release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8NoBOM
+
+          gh release create $env:TAG `
+            $package `
+            'windows-plugin/dist/windows-plugin-build.json' `
+            --target $env:GITHUB_SHA `
+            --title "Windows Plugin v$env:PACKAGE_VERSION" `
+            --notes-file $notesPath
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish $env:TAG" }
