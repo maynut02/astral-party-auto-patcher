@@ -93,5 +93,15 @@ def test_preloader_restores_game_window_foreground_once() -> None:
     assert "SwShowNoActivate" in source
     assert "ScheduleGameForegroundRestore" in source
     assert '"UnityWndClass"' in source
+    assert "TryActivateGameWindow" in source
+    assert "AttachThreadInput" in source
     assert "SetForegroundWindow(gameWindow)" in source
-    assert "WsExTopmost" in source
+    assert "HwndTopmost" in source
+    assert "HwndNoTopmost" in source
+
+
+def test_overlay_close_glyph_avoids_texture_pixel_interop() -> None:
+    source = (PLUGIN / "src/Plugin/AddressablesInProcessPatch.cs").read_text(encoding="utf-8")
+    assert 'glyph.text = "×"' in source
+    assert "CreateCloseGlyphBar" not in source
+    assert "texture.SetPixels(" not in source

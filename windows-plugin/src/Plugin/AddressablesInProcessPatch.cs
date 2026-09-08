@@ -28,7 +28,7 @@ public sealed class AddressablesInProcessPatch : BasePlugin
 {
     public const string PluginGuid = "astral-party.korean-patch.addressables-in-process";
     public const string PluginName = "Astral Party Korean Addressables Patch";
-    public const string PluginVersion = "1.1.1";
+    public const string PluginVersion = "1.1.2";
 
     private const string Repository = "maynut02/astral-party-korean-patch";
     private const string ResourceTypeName =
@@ -1021,7 +1021,6 @@ internal static class OverlayUi
     private static Sprite roundedSprite = null!;
     private static Sprite borderSprite = null!;
     private static Sprite buttonSprite = null!;
-    private static Sprite solidSprite = null!;
     private const string PreferredOverlayFontName = "Afacad-Regular";
     private static Font? overlayFont;
     private static Font? fallbackOverlayFont;
@@ -1370,34 +1369,26 @@ internal static class OverlayUi
         closeRect.sizeDelta = new Vector2(48f, 48f);
         closeRect.anchoredPosition = new Vector2(-18f, -18f);
 
-        // Draw the close glyph from two thin UI bars. This has the same crisp,
-        // vector-like appearance as an SVG X without introducing an SVG
-        // package or a UnityEvent delegate conversion.
-        CreateCloseGlyphBar(closeObject, "CloseLineA", 45f);
-        CreateCloseGlyphBar(closeObject, "CloseLineB", -45f);
+        // Use the already-proven uGUI Text path for the X glyph. Creating a
+        // Texture2D-backed glyph is unreliable across IL2CPP interop because
+        // Texture2D.SetPixels has a different generated signature.
+        var glyph = AddText(closeObject, "CloseGlyph", Vector2.zero,
+            new Vector2(48f, 48f), 32, FontStyle.Normal,
+            new Color(0.92f, 0.97f, 1f, 1f), TextAnchor.MiddleCenter);
+        glyph.text = "×";
+        var glyphRect = glyph.GetComponent<RectTransform>();
+        if (glyphRect != null)
+        {
+            glyphRect.anchorMin = new Vector2(0f, 0f);
+            glyphRect.anchorMax = new Vector2(1f, 1f);
+            glyphRect.pivot = new Vector2(0.5f, 0.5f);
+            glyphRect.sizeDelta = Vector2.zero;
+            glyphRect.anchoredPosition = Vector2.zero;
+        }
+
         AddressablesInProcessPatch.Event("OVERLAY_CLOSE_READY",
-            "button=CloseButton; glyph=two-line-vector-style-x; " +
+            "button=CloseButton; glyph=text-multiplication-sign; " +
             "raycast blocker enabled; input=EventSystem.Update polling");
-    }
-
-    private static void CreateCloseGlyphBar(GameObject parent, string name, float rotation)
-    {
-        var lineObject = new GameObject(name);
-        lineObject.transform.SetParent(parent.transform, false);
-        var line = lineObject.AddComponent<Image>();
-        line.sprite = GetSolidSprite();
-        line.type = Image.Type.Simple;
-        line.color = new Color(0.92f, 0.97f, 1f, 1f);
-        line.raycastTarget = false;
-
-        var rect = lineObject.GetComponent<RectTransform>();
-        if (rect == null) rect = lineObject.AddComponent<RectTransform>();
-        rect.anchorMin = new Vector2(0.5f, 0.5f);
-        rect.anchorMax = new Vector2(0.5f, 0.5f);
-        rect.pivot = new Vector2(0.5f, 0.5f);
-        rect.sizeDelta = new Vector2(3f, 24f);
-        rect.anchoredPosition = Vector2.zero;
-        rect.localRotation = Quaternion.Euler(0f, 0f, rotation);
     }
 
     private static void Close()
@@ -1468,27 +1459,6 @@ internal static class OverlayUi
         sprite.name = spriteName;
         sprite.hideFlags = HideFlags.HideAndDontSave;
         return sprite;
-    }
-
-    private static Sprite GetSolidSprite()
-    {
-        if (solidSprite != null) return solidSprite;
-
-        const int size = 4;
-        var texture = new Texture2D(size, size, TextureFormat.RGBA32, false, true);
-        texture.name = "AstralPartyKoreanPatchSolidSprite";
-        texture.wrapMode = TextureWrapMode.Clamp;
-        texture.hideFlags = HideFlags.HideAndDontSave;
-        var pixels = new Color[size * size];
-        for (var i = 0; i < pixels.Length; i++) pixels[i] = Color.white;
-        texture.SetPixels(pixels);
-        texture.Apply(false, true);
-
-        solidSprite = Sprite.Create(texture, new Rect(0f, 0f, size, size),
-            new Vector2(0.5f, 0.5f), 100f);
-        solidSprite.name = "AstralPartyKoreanPatchSolidSpriteAsset";
-        solidSprite.hideFlags = HideFlags.HideAndDontSave;
-        return solidSprite;
     }
 
     private static Color StatusColor(string status)

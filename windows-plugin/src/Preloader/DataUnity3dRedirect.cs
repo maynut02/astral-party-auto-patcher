@@ -16,7 +16,7 @@ using BepInEx.Preloader.Core.Patching;
 [PatcherPluginInfo(
     "astral-party.korean-patch.data-redirect",
     "Astral Party data.unity3d Redirect",
-    "0.7.1")]
+    "0.7.2")]
 public sealed class DataUnity3dRedirect : BasePatcher
 {
     private const string Repository = "maynut02/astral-party-korean-patch";
@@ -1182,7 +1182,7 @@ public sealed class DataUnity3dRedirect : BasePatcher
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.1");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.2");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
         return client;
@@ -1346,6 +1346,11 @@ public sealed class DataUnity3dRedirect : BasePatcher
         private const int ColorBtnFace = 15;
         private const int TransparentBackground = 1;
         private const int GwlpWndProc = -4;
+        private const uint SwpNoSize = 0x0001;
+        private const uint SwpNoMove = 0x0002;
+        private const uint SwpShowWindow = 0x0040;
+        private static readonly IntPtr HwndTopmost = new IntPtr(-1);
+        private static readonly IntPtr HwndNoTopmost = new IntPtr(-2);
 
         [UnmanagedFunctionPointer(CallingConvention.Winapi)]
         private delegate IntPtr WindowProcDelegate(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
@@ -1447,11 +1452,10 @@ public sealed class DataUnity3dRedirect : BasePatcher
                         var gameWindow = FindUnityGameWindow(processId, progressWindow);
                         if (gameWindow != IntPtr.Zero)
                         {
-                            ShowWindow(gameWindow, SwRestore);
-                            BringWindowToTop(gameWindow);
-                            var foreground = SetForegroundWindow(gameWindow);
+                            var foreground = TryActivateGameWindow(gameWindow);
                             Log("game-window-foreground hwnd=0x" + gameWindow.ToInt64().ToString("X") +
-                                " setForeground=" + foreground);
+                                " activated=" + foreground +
+                                " foreground=0x" + GetForegroundWindow().ToInt64().ToString("X"));
                             return;
                         }
                         Thread.Sleep(100);
@@ -1493,6 +1497,54 @@ public sealed class DataUnity3dRedirect : BasePatcher
                 return true;
             }, IntPtr.Zero);
             return fallback;
+        }
+
+        private static bool TryActivateGameWindow(IntPtr gameWindow)
+        {
+            ShowWindow(gameWindow, SwRestore);
+
+            // Create an input queue for this worker thread before attaching it
+            // to the foreground/game UI threads. This avoids the foreground
+            // lock that made a direct SetForegroundWindow call return false.
+            PeekMessageW(out _, IntPtr.Zero, 0, 0, 0);
+            var currentThread = GetCurrentThreadId();
+            var foregroundWindow = GetForegroundWindow();
+            var foregroundThread = foregroundWindow != IntPtr.Zero
+                ? GetWindowThreadProcessId(foregroundWindow, out _)
+                : 0;
+            var gameThread = GetWindowThreadProcessId(gameWindow, out _);
+
+            var attachedForeground = false;
+            var attachedGame = false;
+            try
+            {
+                if (foregroundThread != 0 && foregroundThread != currentThread)
+                    attachedForeground = AttachThreadInput(currentThread, foregroundThread, true);
+                if (gameThread != 0 && gameThread != currentThread && gameThread != foregroundThread)
+                    attachedGame = AttachThreadInput(currentThread, gameThread, true);
+
+                BringWindowToTop(gameWindow);
+                SetActiveWindow(gameWindow);
+                SetFocus(gameWindow);
+                if (SetForegroundWindow(gameWindow) && GetForegroundWindow() == gameWindow)
+                    return true;
+            }
+            finally
+            {
+                if (attachedGame) AttachThreadInput(currentThread, gameThread, false);
+                if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+            }
+
+            // Fallback: change only the z-order momentarily, then immediately
+            // clear TOPMOST before asking Windows to activate the window again.
+            // The game does not remain always-on-top after this call.
+            SetWindowPos(gameWindow, HwndTopmost, 0, 0, 0, 0,
+                SwpNoMove | SwpNoSize | SwpShowWindow);
+            SetWindowPos(gameWindow, HwndNoTopmost, 0, 0, 0, 0,
+                SwpNoMove | SwpNoSize | SwpShowWindow);
+            BringWindowToTop(gameWindow);
+            SetForegroundWindow(gameWindow);
+            return GetForegroundWindow() == gameWindow;
         }
 
         private void Run()
@@ -1730,6 +1782,26 @@ public sealed class DataUnity3dRedirect : BasePatcher
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetActiveWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter,
+            int x, int y, int width, int height, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool PeekMessageW(out Message message, IntPtr hWnd,
+            uint minFilter, uint maxFilter, uint removeMessage);
     }
 
     private static SteamRouteLayout DetectSteamRoute(string gameRoot, string processName)
