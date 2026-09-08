@@ -190,7 +190,7 @@ foreach ($relative in $requiredPackageFiles) {
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zipPath = Join-Path $dist "AstralPartyKoreanPatch-Windows-v$Version.zip"
+$zipPath = Join-Path $dist "AstralWindowsPlugin-v$Version.zip"
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 [System.IO.Compression.ZipFile]::CreateFromDirectory(
     $stage,

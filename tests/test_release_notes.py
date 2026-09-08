@@ -21,6 +21,26 @@ def test_windows_patcher_notes_include_artifact_hash() -> None:
     assert "a" * 64 in text
 
 
+def test_windows_plugin_notes_match_windows_patcher_structure() -> None:
+    text = MODULE.render_windows_plugin_notes(
+        version="1.0.1",
+        sha256="b" * 64,
+        file_name="AstralWindowsPlugin-v1.0.1.zip",
+        bepinex_version="6.0.0-be.788+5b766a3",
+        preloader_version="0.7.1",
+        plugin_version="1.1.1",
+        repository="owner/repo",
+        run_id="11",
+        run_number="3",
+    )
+    assert text.startswith("## WindowsPlugin\n")
+    assert "## 사용 방법" in text
+    assert "## 파일 확인" in text
+    assert "## 빌드" in text
+    assert "AstralWindowsPlugin-v1.0.1.zip" in text
+    assert "b" * 64 in text
+
+
 def test_android_patcher_notes_include_requirements() -> None:
     text = MODULE.render_android_patcher_notes(
         version="0.1.0", version_code="1000", sha256="c" * 64, size="123456",

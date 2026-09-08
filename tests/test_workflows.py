@@ -34,6 +34,8 @@ def test_windows_plugin_release_uses_version_bump() -> None:
     assert "No existing Windows Plugin release found; starting at 1.0.0." in text
     assert "steps.version.outputs.version" in text
     assert "steps.version.outputs.tag" in text
+    assert '--title "WindowsPlugin v$env:PACKAGE_VERSION"' in text
+    assert "release_notes.py windows-plugin" in text
 
 
 def test_android_release_owns_mobile_index() -> None:

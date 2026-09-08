@@ -83,3 +83,15 @@ def test_plugin_uses_compile_only_ui_reference() -> None:
     assert "using UnityEngine.EventSystems;" not in source
     assert "UnityEngine.UI.Reference.csproj" in project
     assert "Compile-only API surface" in ui_reference
+    assert "Resources.FindObjectsOfTypeAll<Font>()" not in source
+    assert "MakeGenericMethod(typeof(Font)).Invoke" in source
+
+
+def test_preloader_restores_game_window_foreground_once() -> None:
+    source = (PLUGIN / "src/Preloader/DataUnity3dRedirect.cs").read_text(encoding="utf-8")
+    assert "WsExNoActivate" in source
+    assert "SwShowNoActivate" in source
+    assert "ScheduleGameForegroundRestore" in source
+    assert '"UnityWndClass"' in source
+    assert "SetForegroundWindow(gameWindow)" in source
+    assert "WsExTopmost" in source

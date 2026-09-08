@@ -18,6 +18,21 @@ def render_windows_patcher_notes(*, version: str, sha256: str, repository: str, 
     ])
 
 
+def render_windows_plugin_notes(*, version: str, sha256: str, file_name: str, bepinex_version: str, preloader_version: str, plugin_version: str, repository: str, run_id: str, run_number: str) -> str:
+    return "\n".join([
+        "## WindowsPlugin", "", f"- 버전: `{version}`", "- 대상: Windows x64",
+        "- Steam 글로벌/중국판에서 동일한 BepInEx 패키지를 사용합니다.",
+        f"- BepInEx: `{bepinex_version}` / Preloader: `{preloader_version}` / Plugin: `{plugin_version}`",
+        "", "## 사용 방법", "",
+        f"- `{file_name}`을 내려받아 압축을 해제합니다.",
+        "- 압축파일의 내용을 `8vJXnINT` 또는 `8vJXn6CN` 게임 폴더에 그대로 넣습니다.",
+        "- Steam에서 게임을 평소처럼 실행하면 최신 한글패치 리소스를 자동으로 확인하고 적용합니다.",
+        "", "## 파일 확인", "",
+        f"- 파일: `{file_name}`", f"- SHA-256: `{sha256}`", "", "## 빌드", "",
+        f"- {_run_link(repository, run_id, run_number)}", "",
+    ])
+
+
 def render_android_patcher_notes(*, version: str, version_code: str, sha256: str, size: str, repository: str, run_id: str, run_number: str) -> str:
     return "\n".join([
         "## AndroidPatcher", "", f"- 버전: `{version}` (`versionCode {version_code}`)", "- 대상: Android 11 이상",
@@ -61,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     windows.add_argument("--version", required=True)
     windows.add_argument("--sha256", required=True)
 
+    windows_plugin = sub.add_parser("windows-plugin", parents=[common])
+    windows_plugin.add_argument("--version", required=True)
+    windows_plugin.add_argument("--sha256", required=True)
+    windows_plugin.add_argument("--file-name", required=True)
+    windows_plugin.add_argument("--bepinex-version", required=True)
+    windows_plugin.add_argument("--preloader-version", required=True)
+    windows_plugin.add_argument("--plugin-version", required=True)
+
     android = sub.add_parser("android-patcher", parents=[common])
     android.add_argument("--version", required=True)
     android.add_argument("--version-code", required=True)
@@ -81,6 +104,16 @@ def main(argv: list[str] | None = None) -> int:
     common = dict(repository=args.repository, run_id=args.run_id, run_number=args.run_number)
     if args.kind == "windows-patcher":
         text = render_windows_patcher_notes(version=args.version, sha256=args.sha256, **common)
+    elif args.kind == "windows-plugin":
+        text = render_windows_plugin_notes(
+            version=args.version,
+            sha256=args.sha256,
+            file_name=args.file_name,
+            bepinex_version=args.bepinex_version,
+            preloader_version=args.preloader_version,
+            plugin_version=args.plugin_version,
+            **common,
+        )
     elif args.kind == "android-patcher":
         text = render_android_patcher_notes(version=args.version, version_code=args.version_code, sha256=args.sha256, size=args.size, **common)
     elif args.kind == "android-apk":

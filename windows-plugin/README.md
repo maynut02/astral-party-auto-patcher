@@ -44,7 +44,7 @@ Plugin의 Unity 참조는 공식 Unity base libraries와 `src/UnityEngine.UI.Ref
 
 ```text
 windows-plugin/dist/
-├─ AstralPartyKoreanPatch-Windows-v1.0.0.zip
+├─ AstralWindowsPlugin-v1.0.0.zip
 └─ windows-plugin-build.json
 ```
 

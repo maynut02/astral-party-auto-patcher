@@ -28,7 +28,7 @@ public sealed class AddressablesInProcessPatch : BasePlugin
 {
     public const string PluginGuid = "astral-party.korean-patch.addressables-in-process";
     public const string PluginName = "Astral Party Korean Addressables Patch";
-    public const string PluginVersion = "1.1.0";
+    public const string PluginVersion = "1.1.1";
 
     private const string Repository = "maynut02/astral-party-korean-patch";
     private const string ResourceTypeName =
@@ -1289,10 +1289,25 @@ internal static class OverlayUi
     {
         try
         {
-            var fonts = Resources.FindObjectsOfTypeAll<Font>();
-            foreach (var font in fonts)
+            // Unity's reference assemblies expose FindObjectsOfTypeAll<T>() as
+            // returning T[], while BepInEx IL2CPP interop exposes the generated
+            // method as Il2CppArrayBase<T>. Invoke the runtime method through
+            // reflection so the plugin does not bake either return type into IL.
+            var method = typeof(Resources)
+                .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(candidate =>
+                    string.Equals(candidate.Name, "FindObjectsOfTypeAll", StringComparison.Ordinal) &&
+                    candidate.IsGenericMethodDefinition &&
+                    candidate.GetParameters().Length == 0);
+            if (method == null) return null;
+
+            var fonts = method.MakeGenericMethod(typeof(Font)).Invoke(null, null)
+                as System.Collections.IEnumerable;
+            if (fonts == null) return null;
+
+            foreach (var item in fonts)
             {
-                if (font != null && string.Equals(font.name, PreferredOverlayFontName,
+                if (item is Font font && string.Equals(font.name, PreferredOverlayFontName,
                         StringComparison.Ordinal))
                     return font;
             }

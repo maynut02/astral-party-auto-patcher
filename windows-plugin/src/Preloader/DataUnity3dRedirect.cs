@@ -16,7 +16,7 @@ using BepInEx.Preloader.Core.Patching;
 [PatcherPluginInfo(
     "astral-party.korean-patch.data-redirect",
     "Astral Party data.unity3d Redirect",
-    "0.7.0")]
+    "0.7.1")]
 public sealed class DataUnity3dRedirect : BasePatcher
 {
     private const string Repository = "maynut02/astral-party-korean-patch";
@@ -1182,7 +1182,7 @@ public sealed class DataUnity3dRedirect : BasePatcher
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.0");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.1");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
         return client;
@@ -1332,6 +1332,8 @@ public sealed class DataUnity3dRedirect : BasePatcher
         private const uint PbsSmooth = 0x00000001;
         private const int SwShowNoActivate = 4;
         private const int SwHide = 0;
+        private const int SwRestore = 9;
+        private const uint GwOwner = 4;
         private const int SmCxScreen = 0;
         private const int SmCyScreen = 1;
         private const uint WmQuit = 0x0012;
@@ -1347,6 +1349,9 @@ public sealed class DataUnity3dRedirect : BasePatcher
 
         [UnmanagedFunctionPointer(CallingConvention.Winapi)]
         private delegate IntPtr WindowProcDelegate(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         private readonly object sync = new object();
         private Thread? thread;
@@ -1427,6 +1432,67 @@ public sealed class DataUnity3dRedirect : BasePatcher
 
             if (handle != IntPtr.Zero) ShowWindow(handle, SwHide);
             if (threadId != 0) PostThreadMessageW(threadId, WmQuit, IntPtr.Zero, IntPtr.Zero);
+            ScheduleGameForegroundRestore(handle);
+        }
+
+        private static void ScheduleGameForegroundRestore(IntPtr progressWindow)
+        {
+            var worker = new Thread(() =>
+            {
+                try
+                {
+                    var processId = (uint)Process.GetCurrentProcess().Id;
+                    for (var attempt = 0; attempt < 600; attempt++)
+                    {
+                        var gameWindow = FindUnityGameWindow(processId, progressWindow);
+                        if (gameWindow != IntPtr.Zero)
+                        {
+                            ShowWindow(gameWindow, SwRestore);
+                            BringWindowToTop(gameWindow);
+                            var foreground = SetForegroundWindow(gameWindow);
+                            Log("game-window-foreground hwnd=0x" + gameWindow.ToInt64().ToString("X") +
+                                " setForeground=" + foreground);
+                            return;
+                        }
+                        Thread.Sleep(100);
+                    }
+                    Log("game-window-foreground-timeout");
+                }
+                catch (Exception ex)
+                {
+                    Log("game-window-foreground-failed type=" + ex.GetType().Name + " message=" + ex.Message);
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "AstralPartyKoreanPatch.ForegroundRestore"
+            };
+            worker.Start();
+        }
+
+        private static IntPtr FindUnityGameWindow(uint processId, IntPtr progressWindow)
+        {
+            IntPtr fallback = IntPtr.Zero;
+            EnumWindows((hWnd, _) =>
+            {
+                if (hWnd == progressWindow || !IsWindowVisible(hWnd) || GetWindow(hWnd, GwOwner) != IntPtr.Zero)
+                    return true;
+
+                GetWindowThreadProcessId(hWnd, out var ownerProcessId);
+                if (ownerProcessId != processId) return true;
+
+                var className = new StringBuilder(128);
+                GetClassNameW(hWnd, className, className.Capacity);
+                if (string.Equals(className.ToString(), "UnityWndClass", StringComparison.Ordinal))
+                {
+                    fallback = hWnd;
+                    return false;
+                }
+
+                if (fallback == IntPtr.Zero) fallback = hWnd;
+                return true;
+            }, IntPtr.Zero);
+            return fallback;
         }
 
         private void Run()
@@ -1643,6 +1709,27 @@ public sealed class DataUnity3dRedirect : BasePatcher
 
         [DllImport("user32.dll")]
         private static extern bool PostThreadMessageW(uint threadId, uint message, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassNameW(IntPtr hWnd, StringBuilder className, int maxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
     }
 
     private static SteamRouteLayout DetectSteamRoute(string gameRoot, string processName)
