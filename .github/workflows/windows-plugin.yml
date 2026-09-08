@@ -1,4 +1,4 @@
-name: Windows Plugin
+name: WindowsPlugin
 
 on:
   workflow_dispatch:

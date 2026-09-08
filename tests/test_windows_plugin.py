@@ -100,8 +100,10 @@ def test_preloader_restores_game_window_foreground_once() -> None:
     assert "HwndNoTopmost" in source
 
 
-def test_overlay_close_glyph_avoids_texture_pixel_interop() -> None:
+def test_overlay_close_glyph_uses_release_safe_image_icon() -> None:
     source = (PLUGIN / "src/Plugin/AddressablesInProcessPatch.cs").read_text(encoding="utf-8")
-    assert 'glyph.text = "×"' in source
-    assert "CreateCloseGlyphBar" not in source
+    assert "CreateCloseGlyphBar" in source
+    assert "GetSolidSprite" in source
+    assert "texture.SetPixel(0, 0, Color.white)" in source
     assert "texture.SetPixels(" not in source
+    assert 'glyph.text = "×"' not in source

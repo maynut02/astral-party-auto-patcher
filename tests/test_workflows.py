@@ -25,6 +25,7 @@ def test_windows_patcher_release_workflow_is_archived() -> None:
 
 def test_windows_plugin_release_uses_version_bump() -> None:
     text = _text("windows-plugin.yml")
+    assert text.startswith("name: WindowsPlugin\n")
     assert "description: Version bump" in text
     assert "- patch" in text
     assert "- minor" in text
