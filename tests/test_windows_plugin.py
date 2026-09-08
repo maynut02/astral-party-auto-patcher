@@ -47,9 +47,35 @@ def test_package_contains_only_runtime_plugin_outputs() -> None:
     assert "BepInEx/patchers/AstralParty.DataUnity3dRedirect.dll" in script
     assert "BepInEx/plugins/AstralPartyKoreanPatch/AstralParty.AddressablesInProcessPatch.dll" in script
     assert "BepInEx/interop" in script  # explicitly forbidden from the final package
+    assert "적용방법.txt" in script
     assert "LICENSE-BepInEx.txt" in script
+    assert "changelog.txt" in script  # explicitly removed/forbidden from the final package
+    assert "THIRD-PARTY-NOTICES.txt" in script  # explicitly forbidden from the final package
     assert "Read-PreloaderVersion" in script
     assert "Read-PluginVersion" in script
+
+
+def test_install_guide_matches_steam_install_flow_and_removal_files() -> None:
+    guide_path = PLUGIN / "packaging/적용방법.txt"
+    guide = guide_path.read_text(encoding="utf-8")
+    assert guide_path.is_file()
+    assert not (PLUGIN / "packaging/README-KO.txt").exists()
+    assert not (PLUGIN / "packaging/THIRD-PARTY-NOTICES.txt").exists()
+    assert "스팀 - 라이브러리 - Astral Party - 관리 - 로컬 파일 탐색" in guide
+    assert "글로벌판: 8vJXnINT" in guide
+    assert "중국판: 8vJXn6CN" in guide
+    assert "압축파일의 내용물을 전부" in guide
+    assert "화면에 아무런 표시가 없는 상태" in guide
+    for entry in [
+        "BepInEx",
+        "dotnet",
+        ".doorstop_version",
+        "doorstop_config.ini",
+        "winhttp.dll",
+        "적용방법.txt",
+        "LICENSE-BepInEx.txt",
+    ]:
+        assert f"- {entry}" in guide
 
 
 def test_tuned_bepinex_config_keeps_required_settings() -> None:

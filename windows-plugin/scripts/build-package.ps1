@@ -146,6 +146,13 @@ foreach ($path in @($preloaderDll, $pluginDll)) {
 Reset-Directory $stage
 Get-ChildItem -LiteralPath $bepinexRoot -Force | Copy-Item -Destination $stage -Recurse -Force
 
+# Upstream documentation is not needed at runtime. Keep the BepInEx license,
+# but omit its changelog so the release root only contains installable files.
+$upstreamChangelog = Join-Path $stage 'changelog.txt'
+if (Test-Path -LiteralPath $upstreamChangelog) {
+    Remove-Item -LiteralPath $upstreamChangelog -Force
+}
+
 $configDir = Join-Path $stage 'BepInEx/config'
 $patcherDir = Join-Path $stage 'BepInEx/patchers'
 $pluginDir = Join-Path $stage 'BepInEx/plugins/AstralPartyKoreanPatch'
@@ -153,8 +160,7 @@ New-Item -ItemType Directory -Path $configDir,$patcherDir,$pluginDir -Force | Ou
 Copy-Item -LiteralPath (Join-Path $pluginRoot 'config/BepInEx.cfg') -Destination (Join-Path $configDir 'BepInEx.cfg') -Force
 Copy-Item -LiteralPath $preloaderDll -Destination (Join-Path $patcherDir 'AstralParty.DataUnity3dRedirect.dll') -Force
 Copy-Item -LiteralPath $pluginDll -Destination (Join-Path $pluginDir 'AstralParty.AddressablesInProcessPatch.dll') -Force
-Copy-Item -LiteralPath (Join-Path $pluginRoot 'packaging/README-KO.txt') -Destination (Join-Path $stage 'README-KO.txt') -Force
-Copy-Item -LiteralPath (Join-Path $pluginRoot 'packaging/THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt') -Force
+Copy-Item -LiteralPath (Join-Path $pluginRoot 'packaging/적용방법.txt') -Destination (Join-Path $stage '적용방법.txt') -Force
 Copy-Item -LiteralPath $bepinexLicense -Destination (Join-Path $stage 'LICENSE-BepInEx.txt') -Force
 
 $forbidden = @(
@@ -162,7 +168,10 @@ $forbidden = @(
     'BepInEx/AstralPartyKoreanPatch',
     'BepInEx/LogOutput.log',
     'BepInEx/data-redirect.log',
-    'BepInEx/ErrorLog.log'
+    'BepInEx/ErrorLog.log',
+    'changelog.txt',
+    'README-KO.txt',
+    'THIRD-PARTY-NOTICES.txt'
 )
 foreach ($relative in $forbidden) {
     if (Test-Path -LiteralPath (Join-Path $stage $relative)) {
@@ -179,8 +188,7 @@ $requiredPackageFiles = @(
     'BepInEx/config/BepInEx.cfg',
     'BepInEx/patchers/AstralParty.DataUnity3dRedirect.dll',
     'BepInEx/plugins/AstralPartyKoreanPatch/AstralParty.AddressablesInProcessPatch.dll',
-    'README-KO.txt',
-    'THIRD-PARTY-NOTICES.txt',
+    '적용방법.txt',
     'LICENSE-BepInEx.txt'
 )
 foreach ($relative in $requiredPackageFiles) {

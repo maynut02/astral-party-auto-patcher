@@ -1,0 +1,39 @@
+아스트랄 파티 한글패치 - WindowsPlugin
+
+적용 방법
+1. 게임을 완전히 종료합니다.
+2. Steam에서 다음 순서로 게임 설치 경로를 엽니다.
+   스팀 - 라이브러리 - Astral Party - 관리 - 로컬 파일 탐색
+3. 사용하는 버전에 맞는 폴더로 이동합니다.
+   - 글로벌판: 8vJXnINT
+   - 중국판: 8vJXn6CN
+4. 이 압축파일의 내용물을 전부 해당 폴더에 붙여넣습니다.
+   같은 이름의 파일이 있으면 덮어씁니다.
+5. Steam에서 게임을 평소처럼 실행합니다.
+   설치 경로에 따라 글로벌판은 INT_STEAM, 중국판은 CN_STEAM 패치를 자동으로 선택합니다.
+
+참고
+- 최초 실행 시 BepInEx 초기화 및 필요한 런타임 파일 준비 때문에 화면에 아무런 표시가 없는 상태가 잠시 이어질 수 있습니다.
+  일정 시간이 지난 뒤 한글패치 관련 알림이 나타나므로, 바로 강제 종료하지 말고 기다려 주세요.
+- 최초 실행 시 로컬 Addressables catalog가 아직 준비되지 않았다면 호환성을 확인할 수 없어 원본 상태로 실행될 수 있습니다.
+  이 경우 게임 리소스 준비가 끝난 뒤 게임을 다시 실행하세요.
+- 한글패치 리소스는 BepInEx\AstralPartyKoreanPatch 아래에 캐시됩니다.
+- 게임 업데이트에 대응하는 한글패치가 아직 없으면 이전 패치를 억지로 적용하지 않고 원본 상태로 실행합니다.
+
+제거 방법
+이 압축파일로 설치한 BepInEx를 다른 용도로 사용하지 않는 경우, 게임을 종료한 뒤 게임 폴더에서 아래 항목을 모두 삭제하면 됩니다.
+
+- BepInEx
+- dotnet
+- .doorstop_version
+- doorstop_config.ini
+- winhttp.dll
+- 적용방법.txt
+- LICENSE-BepInEx.txt
+
+다른 BepInEx 플러그인을 함께 사용하고 있다면 BepInEx 또는 dotnet 폴더 전체를 삭제하지 마세요.
+
+라이선스
+이 패키지에는 BepInEx 6.0.0-be.788+5b766a3가 포함됩니다.
+BepInEx는 LGPL-2.1 라이선스로 배포되며, 자세한 내용은 LICENSE-BepInEx.txt를 확인하세요.
+소스: https://github.com/BepInEx/BepInEx

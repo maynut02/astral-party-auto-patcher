@@ -10,7 +10,7 @@ Astral Party Windows Steam판용 한국어 패치 런타임과 배포 ZIP을 관
 - `src/Plugin/` — 같은 실행에서 준비된 Addressables payload를 연결하고 게임 내 상태 오버레이를 표시합니다.
 - `src/UnityEngine.UI.Reference/` — 빌드 전용 최소 uGUI reference assembly입니다. 최종 ZIP에는 포함하지 않습니다.
 - `config/BepInEx.cfg` — Astral Party의 HybridCLR 시작 문제를 피하기 위해 조정한 BepInEx 설정입니다.
-- `packaging/` — 사용자 안내와 third-party notice입니다.
+- `packaging/` — 사용자용 `적용방법.txt`를 관리합니다.
 - `scripts/build-package.ps1` — 외부 의존성 다운로드, DLL 빌드, 검증, ZIP 생성을 모두 수행합니다.
 
 ## 지원 경로
@@ -53,5 +53,5 @@ ZIP에는 공식 BepInEx 런타임, 조정된 `BepInEx.cfg`, Preloader, Plugin, 
 ## GitHub Actions
 
 - `CI`의 `windows-plugin` job은 `ubuntu-latest`에서 패키지를 실제로 빌드합니다.
-- `Windows Plugin` workflow는 수동으로 패키지 버전을 입력해 `windows-plugin-vX.Y.Z` immutable Release를 생성합니다.
+- `WindowsPlugin` workflow는 수동으로 패키지 버전을 선택해 `windows-plugin-vX.Y.Z` immutable Release를 생성합니다.
 - Plugin 자체 업데이트 인덱스는 운영하지 않습니다. 코드 업데이트가 필요한 경우 새 ZIP Release를 배포합니다.
