@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '1.0.0',
+    [string]$Version = '2.0.0',
     [string]$WorkRoot = '',
     [string]$OutputRoot = ''
 )
@@ -21,6 +21,7 @@ $bepinexRoot = Join-Path $deps 'bepinex'
 $unityRoot = Join-Path $deps 'unity'
 $downloads = Join-Path $work 'downloads'
 $stage = Join-Path $work 'stage'
+$generatedVersionSource = Join-Path $work 'generated/AstralBuildVersion.g.cs'
 
 $BepInExUrl = 'https://builds.bepinex.dev/projects/bepinex_be/788/BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.788%2B5b766a3.zip'
 $BepInExSha256 = 'f4cc496bd098a0df4164b81e3737297707f13a47c2478dba2f60eefab784817a'
@@ -79,25 +80,24 @@ function Expand-ZipClean([string]$ZipPath, [string]$Destination) {
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
 }
 
+function Write-BuildVersionSource([string]$Path, [string]$PackageVersion) {
+    $directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $content = @"
+internal static class AstralBuildVersion
+{
+    public const string Value = "$PackageVersion";
+}
+"@
+    $content | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+}
+
 function Invoke-DotNetBuild([string]$Project) {
     & dotnet build $Project --configuration Release --nologo `
         "-p:AstralDepsRoot=$deps" `
+        "-p:AstralBuildVersionSource=$generatedVersionSource" `
         -p:ContinuousIntegrationBuild=true
     if ($LASTEXITCODE -ne 0) { throw "dotnet build failed: $Project" }
-}
-
-function Read-PreloaderVersion([string]$SourcePath) {
-    $text = Get-Content -LiteralPath $SourcePath -Raw
-    $match = [regex]::Match($text, '(?s)\[PatcherPluginInfo\(\s*"[^"]+"\s*,\s*"[^"]+"\s*,\s*"([^"]+)"\s*\)\]')
-    if (!$match.Success) { throw "Could not read preloader version from $SourcePath" }
-    return $match.Groups[1].Value
-}
-
-function Read-PluginVersion([string]$SourcePath) {
-    $text = Get-Content -LiteralPath $SourcePath -Raw
-    $match = [regex]::Match($text, 'public\s+const\s+string\s+PluginVersion\s*=\s*"([^"]+)"')
-    if (!$match.Success) { throw "Could not read plugin version from $SourcePath" }
-    return $match.Groups[1].Value
 }
 
 New-Item -ItemType Directory -Path $work,$dist,$deps,$downloads -Force | Out-Null
@@ -128,12 +128,11 @@ foreach ($path in $requiredDependencies) {
     if (!(Test-Path -LiteralPath $path)) { throw "Required build dependency is missing: $path" }
 }
 
-$preloaderSource = Join-Path $pluginRoot 'src/Preloader/DataUnity3dRedirect.cs'
-$pluginSource = Join-Path $pluginRoot 'src/Plugin/AddressablesInProcessPatch.cs'
 $preloaderProject = Join-Path $pluginRoot 'src/Preloader/AstralParty.DataUnity3dRedirect.csproj'
 $pluginProject = Join-Path $pluginRoot 'src/Plugin/AstralParty.AddressablesInProcessPatch.csproj'
-$preloaderVersion = Read-PreloaderVersion $preloaderSource
-$pluginVersion = Read-PluginVersion $pluginSource
+Write-BuildVersionSource $generatedVersionSource $Version
+$preloaderVersion = $Version
+$pluginVersion = $Version
 Invoke-DotNetBuild $preloaderProject
 Invoke-DotNetBuild $pluginProject
 

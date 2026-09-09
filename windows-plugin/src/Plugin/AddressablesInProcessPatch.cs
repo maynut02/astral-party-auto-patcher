@@ -28,7 +28,7 @@ public sealed class AddressablesInProcessPatch : BasePlugin
 {
     public const string PluginGuid = "astral-party.korean-patch.addressables-in-process";
     public const string PluginName = "Astral Party Korean Addressables Patch";
-    public const string PluginVersion = "1.1.3";
+    public const string PluginVersion = AstralBuildVersion.Value;
 
     private const string Repository = "maynut02/astral-party-korean-patch";
     private const string ResourceTypeName =

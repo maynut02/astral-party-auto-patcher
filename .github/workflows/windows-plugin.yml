@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Resolve next Windows Plugin version
+      - name: Resolve next WindowsPlugin version
         id: version
         shell: pwsh
         env:
@@ -48,17 +48,18 @@ jobs:
           $versions = gh release list --limit 1000 --json tagName --jq '.[].tagName' |
             ForEach-Object {
               if ($_ -match '^windows-plugin-v(\d+)\.(\d+)\.(\d+)$') {
-                [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                $candidate = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+                if ($candidate.Major -ge 2) { $candidate }
               }
             }
           if ($LASTEXITCODE -ne 0) {
-            throw 'Failed to read existing Windows Plugin releases.'
+            throw 'Failed to read existing WindowsPlugin releases.'
           }
 
           $candidates = @($versions)
           if ($candidates.Count -eq 0) {
-            $version = '1.0.0'
-            Write-Host 'No existing Windows Plugin release found; starting at 1.0.0.'
+            $version = '2.0.0'
+            Write-Host 'No existing WindowsPlugin v2+ release found; starting at 2.0.0.'
           } else {
             $current = $candidates | Sort-Object -Descending | Select-Object -First 1
             switch ($env:BUMP) {
@@ -68,7 +69,7 @@ jobs:
               default { throw "Unsupported version bump: $env:BUMP" }
             }
             $version = $next.ToString(3)
-            Write-Host "Windows Plugin version: $current -> $version ($env:BUMP)"
+            Write-Host "WindowsPlugin version: $current -> $version ($env:BUMP)"
           }
 
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -80,7 +81,7 @@ jobs:
           python -m pip install pytest pyyaml
           python -m pytest tests
 
-      - name: Build Windows plugin package
+      - name: Build WindowsPlugin package
         shell: pwsh
         run: ./windows-plugin/scripts/build-package.ps1 -Version $env:PACKAGE_VERSION
 
@@ -90,6 +91,12 @@ jobs:
           $metadata = Get-Content 'windows-plugin/dist/windows-plugin-build.json' -Raw | ConvertFrom-Json
           if ($metadata.packageVersion -ne $env:PACKAGE_VERSION) {
             throw "Package metadata version mismatch: $($metadata.packageVersion)"
+          }
+          if ($metadata.preloader.version -ne $env:PACKAGE_VERSION) {
+            throw "Preloader version mismatch: $($metadata.preloader.version)"
+          }
+          if ($metadata.plugin.version -ne $env:PACKAGE_VERSION) {
+            throw "Plugin version mismatch: $($metadata.plugin.version)"
           }
           $package = Join-Path 'windows-plugin/dist' $metadata.package.file
           if (!(Test-Path -LiteralPath $package)) { throw "Package not found: $package" }
@@ -136,11 +143,11 @@ jobs:
 
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            throw "Release $env:TAG already exists; Windows Plugin releases are immutable."
+            throw "Release $env:TAG already exists; WindowsPlugin releases are immutable."
           }
           git ls-remote --exit-code --tags origin "refs/tags/$env:TAG" *> $null
           if ($LASTEXITCODE -eq 0) {
-            throw "Tag $env:TAG already exists; Windows Plugin release tags are immutable."
+            throw "Tag $env:TAG already exists; WindowsPlugin release tags are immutable."
           }
 
           $metadata = Get-Content 'windows-plugin/dist/windows-plugin-build.json' -Raw | ConvertFrom-Json

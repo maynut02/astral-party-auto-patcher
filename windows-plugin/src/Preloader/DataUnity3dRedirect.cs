@@ -16,7 +16,7 @@ using BepInEx.Preloader.Core.Patching;
 [PatcherPluginInfo(
     "astral-party.korean-patch.data-redirect",
     "Astral Party data.unity3d Redirect",
-    "0.7.3")]
+    AstralBuildVersion.Value)]
 public sealed class DataUnity3dRedirect : BasePatcher
 {
     private const string Repository = "maynut02/astral-party-korean-patch";
@@ -1224,7 +1224,7 @@ public sealed class DataUnity3dRedirect : BasePatcher
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.3");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/" + AstralBuildVersion.Value);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
         return client;

@@ -37,14 +37,14 @@ Plugin의 Unity 참조는 공식 Unity base libraries와 `src/UnityEngine.UI.Ref
 .NET 6 SDK와 PowerShell 7이 있으면 Windows뿐 아니라 Linux에서도 실행할 수 있습니다.
 
 ```powershell
-./windows-plugin/scripts/build-package.ps1 -Version 1.0.0
+./windows-plugin/scripts/build-package.ps1 -Version 2.0.0
 ```
 
 결과:
 
 ```text
 windows-plugin/dist/
-├─ AstralWindowsPlugin-v1.0.0.zip
+├─ AstralWindowsPlugin-v2.0.0.zip
 └─ windows-plugin-build.json
 ```
 
@@ -53,5 +53,6 @@ ZIP에는 공식 BepInEx 런타임, 조정된 `BepInEx.cfg`, Preloader, Plugin, 
 ## GitHub Actions
 
 - `CI`의 `windows-plugin` job은 `ubuntu-latest`에서 패키지를 실제로 빌드합니다.
-- `WindowsPlugin` workflow는 수동으로 패키지 버전을 선택해 `windows-plugin-vX.Y.Z` immutable Release를 생성합니다.
+- `WindowsPlugin` workflow는 v2 계열 첫 릴리스를 `2.0.0`으로 시작하고 이후 선택한 patch/minor/major bump를 적용합니다.
+- 패키지 버전은 빌드 시 Preloader와 Plugin에 자동 주입되므로 세 버전은 항상 동일합니다.
 - Plugin 자체 업데이트 인덱스는 운영하지 않습니다. 코드 업데이트가 필요한 경우 새 ZIP Release를 배포합니다.

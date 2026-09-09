@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="$(AstralBuildVersionSource)" Link="AstralBuildVersion.g.cs" Condition="'$(AstralBuildVersionSource)' != '' and Exists('$(AstralBuildVersionSource)')" />
     <Reference Include="BepInEx.Core">
       <HintPath>$(AstralDepsRoot)/bepinex/BepInEx/core/BepInEx.Core.dll</HintPath>
       <Private>false</Private>

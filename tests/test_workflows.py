@@ -30,9 +30,10 @@ def test_windows_plugin_release_uses_version_bump() -> None:
     assert "- patch" in text
     assert "- minor" in text
     assert "- major" in text
-    assert "Resolve next Windows Plugin version" in text
+    assert "Resolve next WindowsPlugin version" in text
     assert "^windows-plugin-v" in text
-    assert "No existing Windows Plugin release found; starting at 1.0.0." in text
+    assert "if ($candidate.Major -ge 2)" in text
+    assert "No existing WindowsPlugin v2+ release found; starting at 2.0.0." in text
     assert "steps.version.outputs.version" in text
     assert "steps.version.outputs.tag" in text
     assert '--title "WindowsPlugin v$env:PACKAGE_VERSION"' in text

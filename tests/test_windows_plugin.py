@@ -51,8 +51,13 @@ def test_package_contains_only_runtime_plugin_outputs() -> None:
     assert "LICENSE-BepInEx.txt" in script
     assert "changelog.txt" in script  # explicitly removed/forbidden from the final package
     assert "THIRD-PARTY-NOTICES.txt" in script  # explicitly forbidden from the final package
-    assert "Read-PreloaderVersion" in script
-    assert "Read-PluginVersion" in script
+    assert "[string]$Version = '2.0.0'" in script
+    assert "Write-BuildVersionSource" in script
+    assert '"-p:AstralBuildVersionSource=$generatedVersionSource"' in script
+    assert "$preloaderVersion = $Version" in script
+    assert "$pluginVersion = $Version" in script
+    assert "Read-PreloaderVersion" not in script
+    assert "Read-PluginVersion" not in script
 
 
 def test_install_guide_matches_steam_install_flow_and_removal_files() -> None:
@@ -98,6 +103,17 @@ def test_windows_plugin_release_builds_on_linux() -> None:
     assert "patcher-index.json" not in workflow
 
 
+def test_windows_plugin_components_share_package_version() -> None:
+    preloader = (PLUGIN / "src/Preloader/DataUnity3dRedirect.cs").read_text(encoding="utf-8")
+    plugin = (PLUGIN / "src/Plugin/AddressablesInProcessPatch.cs").read_text(encoding="utf-8")
+    preloader_project = (PLUGIN / "src/Preloader/AstralParty.DataUnity3dRedirect.csproj").read_text(encoding="utf-8")
+    plugin_project = (PLUGIN / "src/Plugin/AstralParty.AddressablesInProcessPatch.csproj").read_text(encoding="utf-8")
+    assert "AstralBuildVersion.Value" in preloader
+    assert "PluginVersion = AstralBuildVersion.Value" in plugin
+    assert "AstralBuildVersionSource" in preloader_project
+    assert "AstralBuildVersionSource" in plugin_project
+
+
 def test_plugin_uses_compile_only_ui_reference() -> None:
     source = (PLUGIN / "src/Plugin/AddressablesInProcessPatch.cs").read_text(encoding="utf-8")
     project = (PLUGIN / "src/Plugin/AstralParty.AddressablesInProcessPatch.csproj").read_text(
@@ -128,7 +144,7 @@ def test_preloader_restores_game_window_foreground_once() -> None:
 
 def test_preloader_allows_installed_data_unity3d_mismatch() -> None:
     source = (PLUGIN / "src/Preloader/DataUnity3dRedirect.cs").read_text(encoding="utf-8")
-    assert '"0.7.3"' in source
+    assert "AstralBuildVersion.Value" in source
     assert "installed data.unity3d does not match release source" not in source
     assert "installed data.unity3d is missing or unreadable" in source
     assert '" action=" + (matchesManifestSource ? "accepted" : "ignored-mismatch")' in source
