@@ -126,6 +126,18 @@ def test_preloader_restores_game_window_foreground_once() -> None:
     assert "HwndNoTopmost" in source
 
 
+def test_preloader_allows_installed_data_unity3d_mismatch() -> None:
+    source = (PLUGIN / "src/Preloader/DataUnity3dRedirect.cs").read_text(encoding="utf-8")
+    assert '"0.7.3"' in source
+    assert "installed data.unity3d does not match release source" not in source
+    assert "installed data.unity3d is missing or unreadable" in source
+    assert '" action=" + (matchesManifestSource ? "accepted" : "ignored-mismatch")' in source
+    assert "if (info.Length != state.SourceSize) return false;" not in source
+    assert "return true;" in source[source.index("private static bool VerifySource"):source.index("private static bool VerifyReplacement")]
+    assert "if (info.Length != state.PayloadSize) return false;" in source
+    assert "string.Equals(actual, state.PayloadSha256" in source
+
+
 def test_overlay_close_glyph_uses_release_safe_image_icon() -> None:
     source = (PLUGIN / "src/Plugin/AddressablesInProcessPatch.cs").read_text(encoding="utf-8")
     assert "CreateCloseGlyphBar" in source

@@ -16,7 +16,7 @@ using BepInEx.Preloader.Core.Patching;
 [PatcherPluginInfo(
     "astral-party.korean-patch.data-redirect",
     "Astral Party data.unity3d Redirect",
-    "0.7.2")]
+    "0.7.3")]
 public sealed class DataUnity3dRedirect : BasePatcher
 {
     private const string Repository = "maynut02/astral-party-korean-patch";
@@ -218,9 +218,9 @@ public sealed class DataUnity3dRedirect : BasePatcher
             // A candidate release never mutates the active state or active files until every
             // component has been downloaded and verified successfully.
             ValidateInstalledGameAgainstManifest(manifestBytes, candidate);
-            startupProgress?.Update("게임 데이터를 확인하고 있습니다.", "설치된 data.unity3d와 패치 파일을 검증합니다.");
+            startupProgress?.Update("게임 데이터를 확인하고 있습니다.", "설치 상태와 패치 파일을 검증합니다.");
             if (!VerifySource(candidate, fastPath: false))
-                throw new InvalidDataException("installed data.unity3d does not match release source");
+                throw new InvalidDataException("installed data.unity3d is missing or unreadable");
 
             SaveCandidateManifest(manifestBytes, manifestSha);
             if (!VerifyReplacement(candidate, fastPath: false))
@@ -285,7 +285,7 @@ public sealed class DataUnity3dRedirect : BasePatcher
     {
         if (!VerifySource(state, fastPath: true))
         {
-            Log("state-source-mismatch tag=" + state.ReleaseTag);
+            Log("state-source-unavailable tag=" + state.ReleaseTag);
             return false;
         }
 
@@ -422,16 +422,58 @@ public sealed class DataUnity3dRedirect : BasePatcher
 
     private static bool VerifySource(RedirectState state, bool fastPath)
     {
-        if (sourcePath == null || !File.Exists(sourcePath)) return false;
-        var info = new FileInfo(sourcePath);
-        if (info.Length != state.SourceSize) return false;
-        if (fastPath && state.SourceWriteTimeUtcTicks > 0 &&
-            info.LastWriteTimeUtc.Ticks == state.SourceWriteTimeUtcTicks)
+        if (sourcePath == null || !File.Exists(sourcePath))
+        {
+            Log("source-unavailable reason=missing path=" + (sourcePath ?? "<null>"));
+            return false;
+        }
+
+        try
+        {
+            var info = new FileInfo(sourcePath);
+            using (var stream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete))
+            {
+                _ = stream.Length;
+            }
+
+            if (fastPath && state.SourceWriteTimeUtcTicks > 0 &&
+                info.LastWriteTimeUtc.Ticks == state.SourceWriteTimeUtcTicks)
+                return true;
+
+            var sizeMatches = info.Length == state.SourceSize;
+            string actualSha;
+            bool shaMatches;
+            if (sizeMatches)
+            {
+                actualSha = Sha256File(sourcePath);
+                shaMatches = string.Equals(actualSha, state.SourceSha256, StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                actualSha = "skipped-size-mismatch";
+                shaMatches = false;
+            }
+
+            var matchesManifestSource = sizeMatches && shaMatches;
+            Log("source-verify match=" + matchesManifestSource +
+                " sha256=" + actualSha +
+                " expectedSha256=" + state.SourceSha256 +
+                " bytes=" + info.Length +
+                " expectedBytes=" + state.SourceSize +
+                " action=" + (matchesManifestSource ? "accepted" : "ignored-mismatch"));
+
+            // The installed data.unity3d is not used as the patch payload. As long as it exists and
+            // can be opened, source hash/size differences are diagnostic only. The downloaded
+            // replacement is still validated strictly before the CreateFileW redirect is enabled.
             return true;
-        var actual = Sha256File(sourcePath);
-        var valid = string.Equals(actual, state.SourceSha256, StringComparison.OrdinalIgnoreCase);
-        Log("source-verify valid=" + valid + " sha256=" + actual + " bytes=" + info.Length);
-        return valid;
+        }
+        catch (Exception ex)
+        {
+            Log("source-unavailable reason=unreadable type=" + ex.GetType().Name +
+                " message=" + ex.Message + " path=" + sourcePath);
+            return false;
+        }
     }
 
     private static bool VerifyReplacement(RedirectState state, bool fastPath)
@@ -1182,7 +1224,7 @@ public sealed class DataUnity3dRedirect : BasePatcher
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.2");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("astral-party-korean-patch-preloader/0.7.3");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.DefaultRequestHeaders.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
         return client;
