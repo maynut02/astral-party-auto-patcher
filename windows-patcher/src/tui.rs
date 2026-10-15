@@ -844,21 +844,35 @@ fn execute_operation(terminal: &mut DefaultTerminal, app: &mut App) {
                 message,
             },
             Err(SteamInstallError::ExistingPatchChanged(changed_files)) => {
+                logging::warn(format!(
+                    "Steam install requires patch state reset: route={} detail=existing patch changed ({changed_files} files)",
+                    route.as_str()
+                ));
                 app.result_selected = 0;
                 OperationPhase::NeedsPatchStateReset {
                     details: format!("관리 중인 파일 {changed_files}개가 설치 기록과 다릅니다."),
                 }
             }
             Err(SteamInstallError::ExistingPatchUnsafe(summary)) => {
+                logging::warn(format!(
+                    "Steam install requires patch state reset: route={} detail=existing patch unsafe ({summary})",
+                    route.as_str()
+                ));
                 app.result_selected = 0;
                 OperationPhase::NeedsPatchStateReset {
                     details: format!("기존 패치를 안전하게 정리할 수 없습니다. {summary}"),
                 }
             }
-            Err(SteamInstallError::Other(message)) => OperationPhase::Finished {
-                success: false,
-                message,
-            },
+            Err(SteamInstallError::Other(message)) => {
+                logging::error(format!(
+                    "Steam install failed: route={} error={message}",
+                    route.as_str()
+                ));
+                OperationPhase::Finished {
+                    success: false,
+                    message,
+                }
+            }
         };
         if let Some(operation) = &mut app.operation {
             operation.phase = phase;
@@ -873,13 +887,23 @@ fn execute_operation(terminal: &mut DefaultTerminal, app: &mut App) {
                 message,
             },
             Err(SteamRemoveError::ExistingPatchUnsafe(summary)) => {
+                logging::warn(format!(
+                    "Steam remove requires patch state reset: route={} detail=existing patch unsafe ({summary})",
+                    route.as_str()
+                ));
                 app.result_selected = 0;
                 OperationPhase::NeedsRemoveStateReset { summary }
             }
-            Err(SteamRemoveError::Other(message)) => OperationPhase::Finished {
-                success: false,
-                message,
-            },
+            Err(SteamRemoveError::Other(message)) => {
+                logging::error(format!(
+                    "Steam remove failed: route={} error={message}",
+                    route.as_str()
+                ));
+                OperationPhase::Finished {
+                    success: false,
+                    message,
+                }
+            }
         };
         if let Some(operation) = &mut app.operation {
             operation.phase = phase;

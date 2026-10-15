@@ -99,6 +99,15 @@ fn manifest(route: GameRoute) -> PatchManifest {
 
 #[test]
 fn both_steam_routes_install_verify_and_restore_catalog_selected_targets() {
+    check_catalog_selected_targets(false);
+}
+
+#[test]
+fn both_steam_routes_use_game_directory_cache_with_stale_locallow_cache_present() {
+    check_catalog_selected_targets(true);
+}
+
+fn check_catalog_selected_targets(game_cache_present: bool) {
     for route in GameRoute::ALL {
         for runtime_font in [false, true] {
             let temp = tempdir().unwrap();
@@ -147,7 +156,22 @@ fn both_steam_routes_install_verify_and_restore_catalog_selected_targets() {
                 resolved.files[1].source_sha256,
                 published.files[1].source_sha256
             );
+            let game_cache = game
+                .game_data_root
+                .join("com.unity.addressables/AssetBundles");
+            if game_cache_present {
+                fs::create_dir_all(&game_cache).unwrap();
+            }
             let roots = install_roots(&game);
+            let legacy_cache = game.addressables_root.join("AssetBundles");
+            assert_eq!(
+                roots.addressables,
+                if game_cache_present {
+                    game_cache
+                } else {
+                    legacy_cache.clone()
+                }
+            );
             let paths = PatcherPaths::below(temp.path().join("state"));
             let state = paths.route_state(route);
             let decoy = if runtime_font {
@@ -157,6 +181,9 @@ fn both_steam_routes_install_verify_and_restore_catalog_selected_targets() {
             };
             write(&decoy, b"unrelated cache or runtime file");
             for file in &resolved.files {
+                if game_cache_present && file.target == InstallTarget::Addressables {
+                    write(&legacy_cache.join(&file.path), b"stale LocalLow bundle");
+                }
                 let root = if file.target == InstallTarget::GameData {
                     &roots.game_data
                 } else {
@@ -230,6 +257,12 @@ fn both_steam_routes_install_verify_and_restore_catalog_selected_targets() {
                     &roots.addressables
                 };
                 assert_eq!(fs::read(root.join(&file.path)).unwrap(), ORIGINAL);
+                if game_cache_present && file.target == InstallTarget::Addressables {
+                    assert_eq!(
+                        fs::read(legacy_cache.join(&file.path)).unwrap(),
+                        b"stale LocalLow bundle"
+                    );
+                }
             }
             assert_eq!(fs::read(decoy).unwrap(), b"unrelated cache or runtime file");
         }

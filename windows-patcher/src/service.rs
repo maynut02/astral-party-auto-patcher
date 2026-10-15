@@ -276,8 +276,20 @@ pub enum InstallProgress {
 }
 
 pub fn install_roots(game: &GameInstallation) -> InstallRoots {
+    // Recent Steam clients keep their CDN bundle cache beside the game data.
+    // Catalog JSON/hash files still live in LocalLow, so their directory cannot
+    // be used as the bundle cache root unconditionally. Prefer the initialized
+    // game cache even when a previous client left a LocalLow cache behind.
+    let game_cache = game
+        .game_data_root
+        .join(crate::game::ADDRESSABLES_DIR)
+        .join("AssetBundles");
     InstallRoots {
-        addressables: game.addressables_root.join("AssetBundles"),
+        addressables: if game_cache.is_dir() {
+            game_cache
+        } else {
+            game.addressables_root.join("AssetBundles")
+        },
         game_data: game.game_data_root.clone(),
     }
 }
@@ -816,6 +828,15 @@ where
     let roots = install_roots(game);
     let state = paths.route_state(game.route);
     let route = game.route.as_str();
+    logging::info(format!(
+        "Steam install paths: catalog={} bundle_cache={} game_data={}",
+        game.catalog
+            .catalog_path
+            .as_deref()
+            .map_or_else(|| "<missing>".into(), |path| path.display().to_string()),
+        roots.addressables.display(),
+        roots.game_data.display()
+    ));
     logging::info(format!(
         "Steam install resolve: route={} game_version={} catalog={} state={}",
         route,
