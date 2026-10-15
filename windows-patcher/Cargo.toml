@@ -1,6 +1,6 @@
 [package]
 name = "astral-auto-patcher"
-version = "0.8.8"
+version = "0.8.9"
 edition = "2024"
 
 [lib]
@@ -17,6 +17,7 @@ default = ["terminal"]
 terminal = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

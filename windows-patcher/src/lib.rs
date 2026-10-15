@@ -1,3 +1,4 @@
+pub mod catalog;
 #[cfg(feature = "terminal")]
 pub mod cli;
 pub mod game;

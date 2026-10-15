@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::catalog::{CatalogError, resolve_manifest};
 use crate::game::{GameInstallation, GameRoute};
 use crate::install::{
     ApplyPhase, ApplyProgress, InstallError, InstallRootBinding, InstallRoots, InstallSummary,
@@ -19,6 +20,8 @@ pub const RELEASE_CHANNEL: &str = "release";
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
     #[error(transparent)]
     Game(#[from] crate::game::GameDetectError),
     #[error(transparent)]
@@ -44,6 +47,10 @@ pub enum ServiceError {
     ChangedPatchTargets,
     #[error("manifest is not compatible with the detected game")]
     IncompatibleManifest,
+    #[error(
+        "game file does not match the selected release or a verified installed patch: {0}; run the updated game once to refresh its catalog before retrying"
+    )]
+    UnrecognizedGameFile(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -400,7 +407,7 @@ pub fn remove_compatible_patch(
         RELEASE_CHANNEL,
     )?;
     ensure_manifest_compatible(&manifest, game, game.route.as_str())?;
-    let mut restore_manifest = manifest;
+    let mut restore_manifest = resolve_manifest(&manifest, game.catalog.catalog_path.as_deref())?;
     let state = paths.route_state(game.route);
     let roots = install_roots(game);
     // Historical metadata is only used for targets omitted by the current release.
@@ -481,7 +488,7 @@ pub fn remove_installed_patch(
     if ownership.is_none() && pending.is_none() {
         return Ok(None);
     }
-    let mut manifest = if state.manifest_path.is_file() {
+    let mut manifest = if ownership.is_some() && state.manifest_path.is_file() {
         serde_json::from_slice::<PatchManifest>(&fs::read(&state.manifest_path)?)?
     } else if let Some(pending) = pending.as_ref() {
         pending.manifest.clone()
@@ -500,7 +507,15 @@ pub fn remove_installed_patch(
     {
         return Err(ServiceError::IncompatibleManifest);
     }
+    // Saved manifests describe physical paths already used by that installation. Keep those
+    // paths even when an older patcher wrote a cache entry for a now built-in bundle.
     if let Some(pending) = pending.as_ref() {
+        if pending.manifest.patch.route != route.as_str()
+            || pending.manifest.game.version != catalog.version
+            || pending.manifest.game.catalog_hash != catalog.hash
+        {
+            return Err(ServiceError::IncompatibleManifest);
+        }
         merge_restore_targets(&mut manifest, &pending.manifest, roots)?;
     }
     let client = ReleaseClient::new(&format!("AstralAutoPatcher/{}", env!("CARGO_PKG_VERSION")))?;
@@ -515,6 +530,13 @@ fn remove_release_manifest(
     manifest: &PatchManifest,
 ) -> Result<RemoveReport, ServiceError> {
     let state = paths.route_state(route);
+    let ownership = load_ownership_for_roots(&state.ownership_path, roots)
+        .ok()
+        .flatten();
+    let pending = load_pending_manifest(&state.pending_manifest_path)
+        .ok()
+        .flatten();
+    validate_game_data_targets(manifest, roots, ownership.as_ref(), pending.as_ref())?;
     state.reset_staging()?;
     // A fresh staging directory ensures no local originals or stale downloads are reused.
     for file in &manifest.files {
@@ -529,6 +551,7 @@ fn remove_release_manifest(
             )?;
         }
     }
+    validate_game_data_targets(manifest, roots, ownership.as_ref(), pending.as_ref())?;
     let report = restore_release_files(manifest, roots, &state.staging_root)?;
     // Keep the journal when any file is externally changed so removal can be retried.  Also do
     // not clear metadata from a previous game folder after the user retargets the patcher.
@@ -572,6 +595,57 @@ fn ensure_manifest_compatible(
         || manifest.game.catalog_hash != game.catalog.hash
     {
         return Err(ServiceError::IncompatibleManifest);
+    }
+    Ok(())
+}
+
+/// LocalLow can still describe the previous client immediately after a Steam update. A catalog
+/// alone must never authorize replacing a different client or restoring its obsolete originals.
+fn validate_game_data_targets(
+    manifest: &PatchManifest,
+    roots: &InstallRoots,
+    ownership: Option<&OwnershipManifest>,
+    pending: Option<&PendingInstallManifest>,
+) -> Result<(), ServiceError> {
+    let ownership = ownership
+        .filter(|old| old.applies_to(roots) && old.catalog_hash == manifest.game.catalog_hash);
+    let pending = pending.filter(|old| {
+        old.root_binding.matches_roots(roots)
+            && old.manifest.validate().is_ok()
+            && old.manifest.patch.route == manifest.patch.route
+            && old.manifest.game == manifest.game
+    });
+    for file in &manifest.files {
+        if file.target != crate::protocol::InstallTarget::GameData || file.operation != "replace" {
+            continue;
+        }
+        crate::protocol::validate_relative_path(&file.path).map_err(InstallError::from)?;
+        let target = roots.game_data.join(&file.path);
+        if !target.is_file() {
+            return Err(InstallError::ReplaceTargetMissing(target).into());
+        }
+        let hash = crate::install::sha256_file(&target)?;
+        let size = target.metadata()?.len();
+        let selected = (hash == file.sha256 && size == file.size)
+            || (file.source_sha256.as_deref() == Some(hash.as_str())
+                && file.source_size == Some(size));
+        let previous = ownership.is_some_and(|old| {
+            old.modified_files.iter().any(|owned| {
+                owned.target == file.target
+                    && owned.path == file.path
+                    && owned.patched_sha256 == hash
+            })
+        }) || pending.is_some_and(|old| {
+            old.manifest.files.iter().any(|owned| {
+                owned.target == file.target
+                    && owned.path == file.path
+                    && owned.sha256 == hash
+                    && owned.size == size
+            })
+        });
+        if !selected && !previous {
+            return Err(ServiceError::UnrecognizedGameFile(target));
+        }
     }
     Ok(())
 }
@@ -681,6 +755,8 @@ fn reconcile_verified_manifest(
 ) -> Result<bool, ServiceError> {
     manifest.validate().map_err(InstallError::from)?;
     ensure_manifest_compatible(manifest, game, game.route.as_str())?;
+    let resolved = resolve_manifest(manifest, game.catalog.catalog_path.as_deref())?;
+    let manifest = &resolved;
     let roots = install_roots(game);
     let state = paths.route_state(game.route);
     let pending = load_pending_manifest(&state.pending_manifest_path)?
@@ -759,6 +835,7 @@ where
         RELEASE_CHANNEL,
     )?;
     ensure_manifest_compatible(&manifest, game, route)?;
+    let manifest = resolve_manifest(&manifest, game.catalog.catalog_path.as_deref())?;
     logging::info(format!(
         "Steam manifest selected: route={} patch={} files={}",
         route,
@@ -792,6 +869,10 @@ where
             None
         }
     };
+    let pending = load_pending_manifest(&state.pending_manifest_path)
+        .ok()
+        .flatten();
+    validate_game_data_targets(&manifest, &roots, existing.as_ref(), pending.as_ref())?;
     if existing
         .as_ref()
         .filter(|old| old.catalog_hash == manifest.game.catalog_hash)
@@ -864,11 +945,11 @@ where
 
     // This is the operation journal.  It must be durable before any game file is retired or
     // replaced, and it intentionally remains in place when staging or installation fails.
-    let pending = PendingInstallManifest {
+    let journal = PendingInstallManifest {
         manifest: manifest.clone(),
         root_binding: InstallRootBinding::from_roots(&roots),
     };
-    write_json_atomic(&state.pending_manifest_path, &pending)?;
+    write_json_atomic(&state.pending_manifest_path, &journal)?;
 
     if existing.is_some() {
         progress(InstallProgress::RemovingExisting {
@@ -920,6 +1001,8 @@ where
                     }),
                 },
             )?;
+            // Steam may have updated files while the payloads were downloading.
+            validate_game_data_targets(&manifest, &roots, existing.as_ref(), pending.as_ref())?;
             Ok(())
         },
     )?;
@@ -1024,6 +1107,126 @@ mod tests {
                 source_size: None,
             }],
         }
+    }
+
+    #[test]
+    fn stale_catalog_cannot_overwrite_updated_game_data_or_runtime_font() {
+        let temp = tempdir().unwrap();
+        let roots = InstallRoots {
+            addressables: temp.path().join("cache"),
+            game_data: temp.path().join("game"),
+        };
+        let mut patch = manifest("v1", &format!("{:x}", Sha256::digest(b"patch01")));
+        patch.files[0].source_sha256 = Some(format!("{:x}", Sha256::digest(b"original")));
+        patch.files[0].source_size = Some(8);
+        let mut font = patch.files[0].clone();
+        font.path = "StreamingAssets/aa/StandaloneWindows64/font.bundle".into();
+        patch.files.push(font);
+        for file in &patch.files {
+            let target = roots.game_data.join(&file.path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, b"original").unwrap();
+        }
+        validate_game_data_targets(&patch, &roots, None, None).unwrap();
+        let font_target = roots.game_data.join(&patch.files[1].path);
+        fs::write(&font_target, b"new-client-font").unwrap();
+        assert!(
+            matches!(validate_game_data_targets(&patch, &roots, None, None),
+            Err(ServiceError::UnrecognizedGameFile(path)) if path == font_target)
+        );
+        assert_eq!(
+            fs::read(roots.game_data.join("data.unity3d")).unwrap(),
+            b"original"
+        );
+        fs::write(&font_target, b"patch01").unwrap();
+        validate_game_data_targets(&patch, &roots, None, None).unwrap();
+        let data = roots.game_data.join("data.unity3d");
+        fs::write(&data, b"new-client-data").unwrap();
+        assert!(
+            matches!(validate_game_data_targets(&patch, &roots, None, None),
+            Err(ServiceError::UnrecognizedGameFile(path)) if path == data)
+        );
+    }
+
+    #[test]
+    fn game_data_guard_accepts_previous_patch_only_for_same_catalog_and_bound_path() {
+        let temp = tempdir().unwrap();
+        let roots = InstallRoots {
+            addressables: temp.path().join("cache"),
+            game_data: temp.path().join("game"),
+        };
+        fs::create_dir_all(&roots.game_data).unwrap();
+        fs::write(roots.game_data.join("data.unity3d"), b"patch01").unwrap();
+        let old = manifest("v1", &format!("{:x}", Sha256::digest(b"patch01")));
+        let next = manifest("v2", &format!("{:x}", Sha256::digest(b"patch02")));
+        let mut ownership = ownership_for_manifest(&old, &roots, None);
+        validate_game_data_targets(&next, &roots, Some(&ownership), None).unwrap();
+        ownership.catalog_hash = "c".repeat(32);
+        assert!(validate_game_data_targets(&next, &roots, Some(&ownership), None).is_err());
+        ownership.catalog_hash = next.game.catalog_hash.clone();
+        ownership.modified_files[0].path = "different-file".into();
+        assert!(validate_game_data_targets(&next, &roots, Some(&ownership), None).is_err());
+        let mut pending = PendingInstallManifest {
+            manifest: old,
+            root_binding: InstallRootBinding::from_roots(&roots),
+        };
+        validate_game_data_targets(&next, &roots, None, Some(&pending)).unwrap();
+        pending.manifest.patch.route = GameRoute::CnSteam.as_str().into();
+        assert!(validate_game_data_targets(&next, &roots, None, Some(&pending)).is_err());
+        pending.manifest.patch.route = next.patch.route.clone();
+        let foreign = InstallRoots {
+            game_data: temp.path().join("other-game"),
+            addressables: roots.addressables.clone(),
+        };
+        pending.root_binding = InstallRootBinding::from_roots(&foreign);
+        assert!(validate_game_data_targets(&next, &roots, None, Some(&pending)).is_err());
+    }
+
+    #[test]
+    fn interrupted_install_removal_uses_pending_bound_to_selected_game() {
+        let temp = tempdir().unwrap();
+        let paths = PatcherPaths::below(temp.path().join("state"));
+        let state = paths.route_state(GameRoute::IntSteam);
+        let roots = InstallRoots {
+            addressables: temp.path().join("catalog/AssetBundles"),
+            game_data: temp.path().join("game"),
+        };
+        let foreign = InstallRoots {
+            game_data: temp.path().join("other-game"),
+            addressables: roots.addressables.clone(),
+        };
+        let old = manifest("old", &"d".repeat(64));
+        let mut pending = old.clone();
+        pending.game.version = "3.3.0".into();
+        write_json_atomic(
+            &state.ownership_path,
+            &ownership_for_manifest(&old, &foreign, None),
+        )
+        .unwrap();
+        write_json_atomic(&state.manifest_path, &old).unwrap();
+        write_json_atomic(
+            &state.pending_manifest_path,
+            &PendingInstallManifest {
+                manifest: pending,
+                root_binding: InstallRootBinding::from_roots(&roots),
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(roots.addressables.parent().unwrap()).unwrap();
+        fs::write(
+            roots
+                .addressables
+                .parent()
+                .unwrap()
+                .join("catalog_3.3.0.hash"),
+            "b".repeat(32),
+        )
+        .unwrap();
+        assert!(matches!(
+            remove_installed_patch(&paths, &roots, GameRoute::IntSteam),
+            Err(ServiceError::Install(InstallError::ReplaceTargetMissing(_)))
+        ));
+        assert!(state.pending_manifest_path.exists());
     }
 
     #[test]
