@@ -424,9 +424,10 @@ impl<'a> Reader<'a> {
                 self.context
             )));
         }
-        let units: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        // The even-length check above makes every two-byte pair complete.
+        let units: Vec<u16> = (0..bytes.len())
+            .step_by(2)
+            .map(|index| u16::from_le_bytes([bytes[index], bytes[index + 1]]))
             .collect();
         String::from_utf16(&units)
             .map_err(|error| invalid(format!("invalid UTF-16LE in {}: {error}", self.context)))
