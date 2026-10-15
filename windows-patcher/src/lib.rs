@@ -12,6 +12,7 @@ pub mod service;
 pub mod settings;
 #[cfg(feature = "terminal")]
 pub mod tui;
+pub mod updater;
 pub mod uri;
 
 pub use game::{

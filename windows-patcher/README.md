@@ -1,6 +1,10 @@
 # Windows Patcher
 
-기존 Windows 자동 패치 프로그램의 소스입니다. 이번 호환성 수정 버전은 `0.8.9`입니다.
+기존 Windows 자동 패치 프로그램의 소스입니다. 현재 버전은 `1.3.1`입니다.
+
+프로그램을 실행하면 `distribution/patcher-index.json`의 버전과 현재 버전을 비교합니다. 더 최신 버전이 있으면 실행 파일을 다운로드하고 크기와 SHA-256을 확인한 뒤, 기존 프로세스가 종료된 다음 설치된 프로그램을 교체하여 다시 실행합니다. 웹사이트에서 전달한 `astral://` 작업도 재실행 시 그대로 이어집니다. 업데이트 확인이나 다운로드에 실패하면 현재 버전으로 계속 실행합니다.
+
+프로그램 업데이트 정보는 `maynut02/astral-party-auto-patcher`에서, 게임 한글패치 정보는 `maynut02/astral-party-korean-patch`에서 각각 받습니다.
 
 Steam 글로벌(`INT_STEAM`)과 중국(`CN_STEAM`) 버전 모두 게임 카탈로그의 번들 이름과 해시를 기준으로 패치 위치를 선택합니다.
 
@@ -13,6 +17,20 @@ Steam 글로벌(`INT_STEAM`)과 중국(`CN_STEAM`) 버전 모두 게임 카탈�
 Steam 설치 폴더의 교체 대상은 선택한 배포 원본, 적용할 패치 또는 같은 설치 위치·카탈로그에 기록된 이전 패치와 해시가 일치하는지도 먼저 검사합니다. 업데이트된 클라이언트에 옛 카탈로그가 남아 있는 경우에도 서로 다른 버전의 게임 파일을 덮어쓰지 않습니다.
 
 이 수정은 Windows 자동 릴리스 워크플로를 재개하지 않습니다.
+
+다음 프로그램 버전을 배포할 때는 `windows-patcher-v<버전>` GitHub 릴리스에 `AstralWindowsPatcher.exe`를 올리고, `distribution` 브랜치의 `patcher-index.json`을 함께 갱신해야 합니다. 인덱스는 다음 형식을 사용합니다.
+
+```json
+{
+  "schemaVersion": 1,
+  "version": "1.3.1",
+  "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/windows-patcher-v1.3.1/AstralWindowsPatcher.exe",
+  "sha256": "<실행 파일의 SHA-256>",
+  "size": 1234567
+}
+```
+
+`sha256`과 `size`는 실제 배포한 실행 파일 값으로 채웁니다. 새 버전은 기존 배포 인덱스의 `1.3.0`보다 높게 지정하여 이전 배포로 되돌아가지 않도록 합니다. 업데이트 기능이 제거된 기존 프로그램은 이번 버전을 한 번 직접 실행해야 합니다.
 
 저장소 루트에서 다음 명령으로 검증하고 빌드할 수 있습니다.
 
