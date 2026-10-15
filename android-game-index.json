@@ -1,25 +1,25 @@
 {
   "schemaVersion": 1,
   "packageName": "com.feimo.astralpartyjpn",
-  "versionName": "3.2.0",
-  "versionCode": 555,
+  "versionName": "3.3.0",
+  "versionCode": 3300,
   "certificateSha256": "3b151460f9d40e9382bfb6206ee7ffa344a79292dd254eda2b40f8175b5bfad6",
   "deviceProfile": "px_9a",
-  "releaseTag": "android-game-v555",
+  "releaseTag": "android-game-v3300",
   "files": [
     {
       "name": "base.apk",
       "splitName": null,
-      "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-game-v555/base.apk",
-      "sha256": "89e5b0312c5035c83690667a83a69469fc6f996525a326f6d0099b3643f9d09a",
-      "size": 72266484
+      "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-game-v3300/base.apk",
+      "sha256": "e6cc2fc3e906ea10bf7e0b8434e85bcc7dcc18bad3b3409242cb89573b511b7d",
+      "size": 71781261
     },
     {
       "name": "split-001-config.arm64_v8a.apk",
       "splitName": "config.arm64_v8a",
-      "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-game-v555/split-001-config.arm64_v8a.apk",
-      "sha256": "12553fd0a3392b377c6dfa8c567f41b3df123e07301494cd68f03a88d6d8d8bf",
-      "size": 30503955
+      "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-game-v3300/split-001-config.arm64_v8a.apk",
+      "sha256": "8353ea28bf2657d7f0b0e2c4dddc23ba129af62b59836bf8f385e70f4ae79450",
+      "size": 31515837
     }
   ]
 }
