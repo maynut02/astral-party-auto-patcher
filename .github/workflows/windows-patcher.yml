@@ -30,6 +30,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       ASTRAL_PATCH_INDEX_URL: https://raw.githubusercontent.com/maynut02/astral-party-korean-patch/distribution/release-index.json
+      ASTRAL_PATCHER_INDEX_URL: https://raw.githubusercontent.com/maynut02/astral-party-auto-patcher/distribution/patcher-index.json
+      ASTRAL_PATCHER_RELEASE_BASE_URL: https://github.com/maynut02/astral-party-auto-patcher/releases/download
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -152,10 +154,10 @@ jobs:
               throw "Missing or invalid PE metadata $($entry.Key): '$actual'"
             }
           }
-          if (-not $versionInfo.FileVersion.StartsWith($env:VERSION)) {
+          if ($versionInfo.FileVersion -ne $env:VERSION) {
             throw "PE FileVersion does not match release version: $($versionInfo.FileVersion)"
           }
-          if (-not $versionInfo.ProductVersion.StartsWith($env:VERSION)) {
+          if ($versionInfo.ProductVersion -ne $env:VERSION) {
             throw "PE ProductVersion does not match release version: $($versionInfo.ProductVersion)"
           }
           $sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

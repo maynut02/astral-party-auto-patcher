@@ -5,10 +5,10 @@ Astral Party 한국어 패치의 Windows BepInEx 플러그인, 기존 Windows �
 ## 구성
 
 - `windows-plugin/` — 현재 Windows Steam INT/CN용 BepInEx Preloader/Plugin과 배포 ZIP 빌드 ([빌드 안내](windows-plugin/README.md))
-- `windows-patcher/` — 기존 WindowsPatcher. 마지막 배포 버전을 보존하며 신규 기능 개발은 하지 않습니다.
+- `windows-patcher/` — Steam 글로벌/중국판 한글패치 설치·복원 및 프로그램 자동 업데이트
 - `android-patcher/` — Android INT/CN 패치 설치·복원 및 INT 원본 게임 설치 클라이언트
 - `.github/workflows/windows-plugin.yml` — Windows Plugin ZIP 릴리즈
-- `.github/legacy-workflows/windows-patcher.yml` — 기존 WindowsPatcher 릴리즈 workflow 보존(실행 비활성화)
+- `.github/workflows/windows-patcher.yml` — WindowsPatcher 빌드·릴리스 및 자동 업데이트 인덱스 갱신
 - `.github/workflows/android-patcher.yml` — AndroidPatcher 릴리즈
 - `.github/workflows/android-game-original.yml` — Google Play 원본 split APK 릴리즈
 - `distribution` branch
@@ -30,7 +30,7 @@ Windows Plugin은 공식 BepInEx 6 IL2CPP 패키지와 Unity base libraries를 �
 
 CI와 릴리즈 workflow는 `ubuntu-latest`에서 동일한 빌드를 수행합니다.
 
-### WindowsPatcher (legacy)
+### WindowsPatcher
 
 ```bash
 cd windows-patcher
@@ -38,6 +38,8 @@ cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
+
+배포는 GitHub Actions의 `WindowsPatcher` → `Run workflow`에서 `bump`(`patch`/`minor`/`major`)를 선택해 실행합니다. 기존 릴리스·배포 인덱스·Cargo 버전 중 가장 높은 버전을 기준으로 다음 버전을 정하고, 검증한 `AstralWindowsPatcher.exe`를 새 릴리스에 올린 뒤 `distribution/patcher-index.json`을 갱신합니다. 실행 중인 프로그램은 이 인덱스를 통해 새 버전을 받습니다.
 
 ### AndroidPatcher
 

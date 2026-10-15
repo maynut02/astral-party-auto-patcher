@@ -9,14 +9,34 @@ def _text(name: str) -> str:
     return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
 
 
-def test_windows_patcher_release_workflow_is_archived() -> None:
+def test_windows_patcher_release_workflow_builds_and_updates_distribution() -> None:
     active = ROOT / ".github/workflows/windows-patcher.yml"
     archived = ROOT / ".github/legacy-workflows/windows-patcher.yml"
-    assert not active.exists()
-    assert archived.is_file()
+    assert active.is_file()
+    assert not archived.exists()
 
-    text = archived.read_text(encoding="utf-8")
+    text = active.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    trigger = workflow.get("on", workflow.get(True))
+    assert set(trigger) == {"workflow_dispatch"}
+    assert trigger["workflow_dispatch"]["inputs"]["bump"]["options"] == ["patch", "minor", "major"]
+    assert workflow["permissions"]["contents"] == "write"
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    job = workflow["jobs"]["build"]
+    assert job["runs-on"] == "windows-latest"
+    assert job["defaults"]["run"]["working-directory"] == "windows-patcher"
     assert "maynut02/astral-party-korean-patch/distribution/release-index.json" in text
+    assert job["env"]["ASTRAL_PATCHER_INDEX_URL"].endswith("astral-party-auto-patcher/distribution/patcher-index.json")
+    assert job["env"]["ASTRAL_PATCHER_RELEASE_BASE_URL"].endswith("astral-party-auto-patcher/releases/download")
+    commands = {step.get("name"): step.get("run", "") for step in job["steps"]}
+    assert commands["Rust format"] == "cargo fmt --all -- --check"
+    assert commands["Rust tests"] == "cargo test --locked --all-targets --all-features"
+    assert commands["Rust clippy"] == "cargo clippy --locked --all-targets --all-features -- -D warnings"
+    assert commands["Build portable EXE"] == "cargo build --locked --release --bin AstralAutoPatcher"
+    names = list(commands)
+    assert names.index("Verify EXE") < names.index("Publish immutable WindowsPatcher release")
+    assert names.index("Publish immutable WindowsPatcher release") < names.index("Update WindowsPatcher distribution index")
+    assert "--target $env:GITHUB_SHA" in commands["Publish immutable WindowsPatcher release"]
     assert "--path patcher-index.json" in text
     assert "windows-patcher-v" in text
     assert "gh release view patcher-index" not in text

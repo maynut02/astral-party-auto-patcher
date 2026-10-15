@@ -16,9 +16,9 @@ Steam 글로벌(`INT_STEAM`)과 중국(`CN_STEAM`) 버전 모두 게임 카탈�
 
 Steam 설치 폴더의 교체 대상은 선택한 배포 원본, 적용할 패치 또는 같은 설치 위치·카탈로그에 기록된 이전 패치와 해시가 일치하는지도 먼저 검사합니다. 업데이트된 클라이언트에 옛 카탈로그가 남아 있는 경우에도 서로 다른 버전의 게임 파일을 덮어쓰지 않습니다.
 
-이 수정은 Windows 자동 릴리스 워크플로를 재개하지 않습니다.
+GitHub Actions의 `WindowsPatcher` 워크플로에서 `Run workflow`를 누르고 `bump`(`patch`/`minor`/`major`)를 선택하면 테스트·빌드·릴리스와 자동 업데이트 인덱스 갱신까지 진행합니다. 기존 릴리스·배포 인덱스·Cargo 버전 중 가장 높은 버전을 기준으로 선택한 단위를 증가시키며, 빌드에서 사용하는 `Cargo.toml`과 `Cargo.lock` 버전을 함께 맞춥니다. EXE의 버전·메타데이터·SHA-256·크기를 확인한 뒤 배포하고, 인덱스는 릴리스 생성에 성공한 후에만 갱신합니다.
 
-다음 프로그램 버전을 배포할 때는 `windows-patcher-v<버전>` GitHub 릴리스에 `AstralWindowsPatcher.exe`를 올리고, `distribution` 브랜치의 `patcher-index.json`을 함께 갱신해야 합니다. 인덱스는 다음 형식을 사용합니다.
+워크플로는 `windows-patcher-v<버전>` GitHub 릴리스에 `AstralWindowsPatcher.exe`를 올리고 `distribution` 브랜치의 `patcher-index.json`을 다음 형식으로 생성합니다.
 
 ```json
 {
