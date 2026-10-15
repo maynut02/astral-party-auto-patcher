@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "version": "1.4.0",
-  "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/windows-patcher-v1.4.0/AstralWindowsPatcher.exe",
-  "sha256": "32b47c290be92b446c33a41869a4508852eec0c1c96590d7050edb1012e64388",
-  "size": 4806656
+  "version": "1.5.0",
+  "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/windows-patcher-v1.5.0/AstralWindowsPatcher.exe",
+  "sha256": "2c7f3105be5ed4c0db5a0d412715ea8c8e0dcb8509c0f39e38bd1ea93f816f8b",
+  "size": 4810240
 }
