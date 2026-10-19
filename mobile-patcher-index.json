@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
-  "versionCode": 1004000,
-  "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-patcher-v1.4.0/AstralAndroidPatcher.apk",
-  "sha256": "4c4a50f2fa5acd6c61b954ede2c3434d9d3781215807dae3a7c2678ecd6d7833",
-  "size": 2928944
+  "version": "1.5.0",
+  "versionCode": 1005000,
+  "downloadUrl": "https://github.com/maynut02/astral-party-auto-patcher/releases/download/android-patcher-v1.5.0/AstralAndroidPatcher.apk",
+  "sha256": "dd05464812ff283f2e9095b9326484b838a16ca425cb5f9e5ba12948192ca2fb",
+  "size": 2994480
 }
