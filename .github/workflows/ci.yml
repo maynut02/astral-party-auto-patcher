@@ -9,17 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  windows-plugin:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 6.0.x
-      - name: Build Windows plugin package
-        shell: pwsh
-        run: ./windows-plugin/scripts/build-package.ps1 -Version 0.0.0
-
   android-patcher:
     runs-on: ubuntu-latest
     defaults:
