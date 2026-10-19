@@ -45,5 +45,6 @@ interface IPatchService {
     ) = 11;
     String commitGameInstall(String installId) = 12;
     void cancelGameInstall(String installId) = 13;
+    void beginPlannedPatch(String transactionId, String packageName, String planJson) = 14;
     void destroy() = 16777114;
 }

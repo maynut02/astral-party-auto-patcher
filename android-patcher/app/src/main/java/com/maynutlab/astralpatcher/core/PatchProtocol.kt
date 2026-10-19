@@ -1,6 +1,7 @@
 package com.maynutlab.astralpatcher.core
 
 import org.json.JSONObject
+import java.math.BigInteger
 import java.net.URI
 import java.security.MessageDigest
 import java.util.Locale
@@ -20,6 +21,9 @@ data class CatalogIdentity(
     val gameVersion: String,
     val catalogHash: String,
     val installedPatchVersion: String?,
+    val historyStatus: String = "UNKNOWN",
+    val historyError: String = "",
+    val diagnostic: String = "",
 )
 
 data class ReleaseEntry(
@@ -56,14 +60,50 @@ data class PatchManifest(
     val files: List<PatchFile>,
 )
 
+data class PatchTargetDiagnostic(
+    val path: String,
+    val actualPath: String,
+    val size: Long?,
+    val sha256: String,
+    val state: String,
+    val error: String = "",
+    val candidates: List<String> = emptyList(),
+) {
+    val isKnown: Boolean
+        get() = state in setOf("ORIGINAL", "CURRENT_PATCH", "KNOWN_OLDER_PATCH")
+
+    val canWrite: Boolean
+        get() = (isKnown || state == "UNKNOWN_MODIFIED") && actualPath.isNotBlank() &&
+            size != null && size >= 0 && sha256.matches(Regex("[0-9a-fA-F]{64}")) &&
+            error.isBlank() && candidates.size <= 1 &&
+            (candidates.isEmpty() || candidates.single() == actualPath)
+}
+
 data class PatchTargetInspection(
     val total: Int,
     val ready: Int,
     val missing: Int,
     val incompatible: Int,
+    val files: List<PatchTargetDiagnostic> = emptyList(),
+    val catalogHash: String? = null,
+    val catalogMatches: Boolean = true,
+    val planJson: String? = null,
+    val unreadable: Int = 0,
+    val ambiguous: Int = 0,
+    val warnings: List<String> = emptyList(),
 ) {
     val isReady: Boolean
-        get() = total > 0 && ready == total && missing == 0 && incompatible == 0
+        get() = catalogMatches && total > 0 && ready == total && missing == 0 &&
+            incompatible == 0 && unreadable == 0 && ambiguous == 0 &&
+            (files.isEmpty() || (canWrite && files.all { it.isKnown }))
+
+    val canWrite: Boolean
+        get() = total > 0 && ready >= 0 && incompatible >= 0 && missing == 0 &&
+            unreadable == 0 && ambiguous == 0 && ready.toLong() + incompatible == total.toLong() &&
+            // Legacy summaries prove readability only for READY files.
+            (if (files.isEmpty()) ready == total else files.size == total &&
+                files.all { it.canWrite } && files.map { it.path }.distinct().size == total &&
+                files.map { it.actualPath }.distinct().size == total)
 }
 
 data class PatchApplyResult(
@@ -107,15 +147,27 @@ data class PatchDiagnostics(
 object PatchProtocol {
     fun parseInspection(json: String): CatalogIdentity {
         val root = JSONObject(json)
-        require(root.getInt("schemaVersion") == 1) { "지원하지 않는 게임 진단 결과입니다." }
+        val schema = root.getInt("schemaVersion")
+        require(schema in 1..2) { "지원하지 않는 게임 진단 결과입니다." }
+        val catalogHash = if (schema == 1) root.getString("catalogHash")
+            else nullableString(root, "catalogHash").orEmpty()
         return CatalogIdentity(
-            gameVersion = root.getString("gameVersion"),
-            catalogHash = requireHex(root.getString("catalogHash"), 32, "catalog hash"),
-            installedPatchVersion = root.optString("patchVersion").takeIf { it.isNotBlank() },
+            gameVersion = if (schema == 1) root.getString("gameVersion")
+                else nullableString(root, "gameVersion").orEmpty(),
+            catalogHash = if (schema == 2 && catalogHash.isEmpty()) ""
+                else requireHex(catalogHash, 32, "catalog hash"),
+            installedPatchVersion = nullableString(root, "patchVersion"),
+            historyStatus = nullableString(root, "historyStatus") ?: "UNKNOWN",
+            historyError = nullableString(root, "historyError").orEmpty(),
+            diagnostic = inspectionDiagnostic(root),
         )
     }
 
-    fun latestReleaseForRoute(json: String, route: String, gameVersion: String? = null): ReleaseEntry? {
+    /** Newest first, restricted to the requested route/channel and optional exact APK version.
+     * Call again without gameVersion if an empty APK-version list needs route-wide fallback.
+     * Entries retain their index-provided manifest digest; duplicates are never coalesced.
+     */
+    fun releasesForRoute(json: String, route: String, gameVersion: String? = null): List<ReleaseEntry> {
         val root = JSONObject(json)
         require(root.getInt("schemaVersion") == 1) { "지원하지 않는 release index입니다." }
         val releases = root.getJSONArray("releases")
@@ -130,59 +182,48 @@ object PatchProtocol {
                     ReleaseEntry(
                         route = route,
                         gameVersion = item.getString("gameVersion"),
-                        revision = item.getString("revision"),
+                        revision = item.getString("revision").also {
+                            require(it.isNotBlank()) { "게임 revision이 비어 있습니다." }
+                        },
                         catalogHash = requireHex(item.getString("catalogHash"), 32, "catalog hash"),
                         patchVersion = item.getString("patchVersion").also {
                             require(it.isNotBlank()) { "patch version이 비어 있습니다." }
                         },
-                        uploadedAt = item.optString("uploadedAt").takeIf { it.isNotBlank() },
+                        uploadedAt = PatchUploadTimeProtocol.normalizeTimestamp(item.opt("uploadedAt") as? String),
                         manifestUrl = manifestUrl,
                         manifestSha256 = requireHex(item.getString("manifestSha256"), 64, "manifest SHA-256"),
                     )
                 )
             }
         }
-        return matches.maxWithOrNull(Comparator { left, right ->
-            val versionOrder = compareVersionStrings(left.gameVersion, right.gameVersion)
-            if (versionOrder != 0) versionOrder
-            else (left.revision.removePrefix("r").toLongOrNull() ?: -1L)
-                .compareTo(right.revision.removePrefix("r").toLongOrNull() ?: -1L)
-        })
+        val identities = mutableSetOf<List<String>>()
+        matches.forEach { release ->
+            check(identities.add(listOf(release.gameVersion, release.revision, release.patchVersion))) {
+                "정식 Android patch가 중복되어 선택이 모호합니다: ${release.patchVersion}"
+            }
+        }
+        return matches.sortedWith(
+            Comparator<ReleaseEntry>(::compareReleaseOrder)
+                .thenBy { it.gameVersion }.thenBy { it.revision }.thenBy { it.patchVersion }
+                .thenBy { it.catalogHash }.thenBy { it.manifestSha256 }.reversed()
+        )
+    }
+
+    fun latestReleaseForRoute(json: String, route: String, gameVersion: String? = null): ReleaseEntry? =
+        selectLatest(releasesForRoute(json, route, gameVersion))
+
+    fun compatibleReleases(json: String, catalog: CatalogIdentity, route: String): List<ReleaseEntry> {
+        if (catalog.gameVersion.isBlank() || catalog.catalogHash.isBlank()) return emptyList()
+        val hash = requireHex(catalog.catalogHash, 32, "catalog hash")
+        return releasesForRoute(json, route, catalog.gameVersion).filter { it.catalogHash == hash }
     }
 
     fun resolveRelease(json: String, catalog: CatalogIdentity, route: String): ReleaseEntry? {
-        val root = JSONObject(json)
-        require(root.getInt("schemaVersion") == 1) { "지원하지 않는 release index입니다." }
-        val releases = root.getJSONArray("releases")
-        var matched: ReleaseEntry? = null
-        for (index in 0 until releases.length()) {
-            val item = releases.getJSONObject(index)
-            if (item.getString("route") != route ||
-                item.getString("channel") != PATCH_CHANNEL ||
-                item.getString("gameVersion") != catalog.gameVersion ||
-                item.getString("catalogHash").lowercase(Locale.ROOT) != catalog.catalogHash
-            ) {
-                continue
-            }
-            check(matched == null) { "현재 게임에 일치하는 정식 Android patch가 중복되어 있습니다." }
-            val manifestUrl = item.getString("manifestUrl")
-            TrustedUrls.requireReleaseAsset(manifestUrl)
-            matched = ReleaseEntry(
-                route = route,
-                gameVersion = item.getString("gameVersion"),
-                revision = item.getString("revision"),
-                catalogHash = requireHex(item.getString("catalogHash"), 32, "catalog hash"),
-                patchVersion = item.getString("patchVersion").also {
-                    require(it.isNotBlank()) { "patch version이 비어 있습니다." }
-                },
-                uploadedAt = item.optString("uploadedAt").takeIf { it.isNotBlank() },
-                manifestUrl = manifestUrl,
-                manifestSha256 = requireHex(
-                    item.getString("manifestSha256"), 64, "manifest SHA-256"
-                ),
-            )
+        val matches = compatibleReleases(json, catalog, route)
+        check(matches.map { it.revision }.distinct().size <= 1) {
+            "현재 리소스에 일치하는 배포 정보가 모호합니다. 배포 인덱스를 확인해 주세요."
         }
-        return matched
+        return selectLatest(matches)
     }
 
     fun parseManifest(bytes: ByteArray, release: ReleaseEntry, expectedRoute: String): PatchManifest {
@@ -256,26 +297,51 @@ object PatchProtocol {
         )
     }
 
-    fun createTargetInspectionRequest(manifest: PatchManifest): String {
+    fun createTargetInspectionRequest(
+        manifest: PatchManifest,
+        release: ReleaseEntry? = null,
+        operation: String = "PATCH",
+        apkSnapshot: String? = null,
+    ): String {
         require(manifest.files.isNotEmpty() && manifest.files.size <= MAX_PATCH_FILES) {
             "검사할 patch 파일 수가 올바르지 않습니다."
         }
+        require(operation == "PATCH" || operation == "RESTORE") { "지원하지 않는 리소스 작업입니다." }
+        require(manifest.patchVersion.isNotBlank() && manifest.gameVersion.isNotBlank() &&
+            manifest.route.isNotBlank()) { "검사할 patch 정보가 비어 있습니다." }
+        val catalogHash = requireHex(manifest.catalogHash, 32, "catalog hash")
+        if (release != null) {
+            require(release.route == manifest.route && release.gameVersion == manifest.gameVersion &&
+                release.revision == manifest.revision && release.catalogHash == catalogHash &&
+                release.patchVersion == manifest.patchVersion) {
+                "선택한 release가 검사할 manifest와 다릅니다."
+            }
+        }
+        val manifestSha256 = release?.let { requireHex(it.manifestSha256, 64, "manifest SHA-256") }
+        val paths = mutableSetOf<String>()
         val files = org.json.JSONArray()
         manifest.files.forEach { item ->
+            val path = safeRelativePath(item.relativePath)
+            require(paths.add(path)) { "중복된 patch 경로입니다: $path" }
             files.put(
                 JSONObject()
-                    .put("path", safeRelativePath(item.relativePath))
-                    .put("sourceSize", item.sourceSize)
-                    .put("sourceSha256", item.sourceSha256)
-                    .put("payloadSize", item.payloadSize)
-                    .put("payloadSha256", item.payloadSha256)
+                    .put("path", path)
+                    .put("sourceSize", positive(item.sourceSize, "source size"))
+                    .put("sourceSha256", requireHex(item.sourceSha256, 64, "source SHA-256"))
+                    .put("payloadSize", positive(item.payloadSize, "payload size"))
+                    .put("payloadSha256", requireHex(item.payloadSha256, 64, "payload SHA-256"))
             )
         }
         val request = JSONObject()
-            .put("schemaVersion", 1)
-            .put("catalogHash", manifest.catalogHash)
+            .put("schemaVersion", 2)
+            .put("route", manifest.route)
+            .put("gameVersion", manifest.gameVersion)
+            .put("catalogHash", catalogHash)
             .put("patchVersion", manifest.patchVersion)
+            .put("manifestSha256", manifestSha256.orEmpty())
+            .put("operation", operation)
             .put("files", files)
+            .put("apkSnapshot", apkSnapshot ?: JSONObject.NULL)
             .toString()
         require(request.toByteArray(Charsets.UTF_8).size <= MAX_INSPECTION_REQUEST_BYTES) {
             "리소스 검사 요청이 허용 크기를 초과합니다."
@@ -285,19 +351,63 @@ object PatchProtocol {
 
     fun parseTargetInspection(json: String): PatchTargetInspection {
         val root = JSONObject(json)
-        require(root.getInt("schemaVersion") == 1) { "지원하지 않는 리소스 검사 결과입니다." }
+        val schema = root.getInt("schemaVersion")
+        require(schema in 1..2) { "지원하지 않는 리소스 검사 결과입니다." }
+        val files = if (schema == 1) emptyList() else {
+            val rawFiles = root.getJSONArray("files")
+            require(rawFiles.length() in 1..MAX_PATCH_FILES) { "리소스 검사 대상 수가 올바르지 않습니다." }
+            List(rawFiles.length()) { index ->
+                val item = rawFiles.getJSONObject(index)
+                val state = item.getString("state")
+                require(state in TARGET_STATES) { "지원하지 않는 리소스 파일 상태입니다: $state" }
+                PatchTargetDiagnostic(
+                    path = safeRelativePath(item.getString("path")),
+                    actualPath = nullableString(item, "actualPath").orEmpty(),
+                    size = if (item.isNull("size")) null else item.getLong("size").also {
+                        require(it >= 0) { "리소스 크기가 올바르지 않습니다." }
+                    },
+                    sha256 = nullableString(item, "sha256")?.let {
+                        requireHex(it, 64, "observed SHA-256")
+                    }.orEmpty(),
+                    state = state,
+                    error = nullableString(item, "error").orEmpty(),
+                    candidates = parseStrings(item, "candidates"),
+                )
+            }
+        }
+        val catalogHash = if (schema == 1) null else nullableString(root, "observedCatalogHash")
+            ?.let { requireHex(it, 32, "observed catalog hash") }
         val result = PatchTargetInspection(
             total = root.getInt("total"),
             ready = root.getInt("ready"),
             missing = root.getInt("missing"),
             incompatible = root.getInt("incompatible"),
+            files = files,
+            catalogHash = catalogHash,
+            catalogMatches = if (schema == 1) true else root.getBoolean("catalogMatches"),
+            planJson = if (root.isNull("plan")) null else root.getJSONObject("plan").toString(),
+            unreadable = if (schema == 1) 0 else root.getInt("unreadable"),
+            ambiguous = if (schema == 1) 0 else root.getInt("ambiguous"),
+            warnings = parseStrings(root, "warnings"),
         )
         require(result.total in 1..MAX_PATCH_FILES) { "리소스 검사 대상 수가 올바르지 않습니다." }
-        require(result.ready >= 0 && result.missing >= 0 && result.incompatible >= 0) {
+        require(result.ready >= 0 && result.missing >= 0 && result.incompatible >= 0 &&
+            result.unreadable >= 0 && result.ambiguous >= 0) {
             "리소스 검사 결과에 음수 값이 있습니다."
         }
-        require(result.ready + result.missing + result.incompatible == result.total) {
+        require(result.ready.toLong() + result.missing + result.incompatible + result.unreadable +
+            result.ambiguous == result.total.toLong()) {
             "리소스 검사 결과 합계가 올바르지 않습니다."
+        }
+        if (schema == 2) {
+            require(files.size == result.total && files.count { it.isKnown } == result.ready &&
+                files.count { it.state == "MISSING" } == result.missing &&
+                files.count { it.state == "UNKNOWN_MODIFIED" } == result.incompatible &&
+                files.count { it.state == "UNREADABLE" } == result.unreadable &&
+                files.count { it.state == "AMBIGUOUS" } == result.ambiguous) {
+                "리소스 파일 진단과 검사 합계가 다릅니다."
+            }
+            require(!result.catalogMatches || catalogHash != null) { "일치하는 카탈로그 정보가 없습니다." }
         }
         return result
     }
@@ -391,15 +501,68 @@ object PatchProtocol {
         )
     }
 
+    private fun selectLatest(releases: List<ReleaseEntry>): ReleaseEntry? {
+        val latest = releases.firstOrNull() ?: return null
+        check(releases.drop(1).none { compareReleaseOrder(latest, it) == 0 }) {
+            "최신 정식 Android patch 정보가 모호합니다. 배포 인덱스를 확인해 주세요."
+        }
+        return latest
+    }
+
+    private fun compareReleaseOrder(left: ReleaseEntry, right: ReleaseEntry): Int {
+        val versionOrder = compareVersionStrings(left.gameVersion, right.gameVersion)
+        if (versionOrder != 0) return versionOrder
+        // p is meaningful only inside the same metadata game version and revision.
+        // In particular, the tag's r segment is NOT game.revision.
+        if (left.gameVersion != right.gameVersion) return left.gameVersion.compareTo(right.gameVersion)
+        val leftRevision = left.revision.removePrefix("r").toBigIntegerOrNull()
+        val rightRevision = right.revision.removePrefix("r").toBigIntegerOrNull()
+        val revisionOrder = if (leftRevision != null && rightRevision != null)
+            leftRevision.compareTo(rightRevision) else left.revision.compareTo(right.revision)
+        if (revisionOrder != 0) return revisionOrder
+        if (left.revision != right.revision) return left.revision.compareTo(right.revision)
+        return patchNumber(left.patchVersion).compareTo(patchNumber(right.patchVersion))
+    }
+
+    private fun patchNumber(version: String): BigInteger =
+        Regex("_p([0-9]+)$").find(version)?.groupValues?.get(1)?.toBigInteger() ?: BigInteger.ZERO
+
     private fun compareVersionStrings(left: String, right: String): Int {
-        val leftParts = left.split('.').map { it.toLongOrNull() ?: 0L }
-        val rightParts = right.split('.').map { it.toLongOrNull() ?: 0L }
+        val leftParts = left.split('.').map { it.toBigIntegerOrNull() ?: BigInteger.ZERO }
+        val rightParts = right.split('.').map { it.toBigIntegerOrNull() ?: BigInteger.ZERO }
         for (index in 0 until maxOf(leftParts.size, rightParts.size)) {
-            val compared = leftParts.getOrElse(index) { 0L }
-                .compareTo(rightParts.getOrElse(index) { 0L })
+            val compared = leftParts.getOrElse(index) { BigInteger.ZERO }
+                .compareTo(rightParts.getOrElse(index) { BigInteger.ZERO })
             if (compared != 0) return compared
         }
         return 0
+    }
+
+    private fun nullableString(root: JSONObject, key: String): String? =
+        if (root.isNull(key)) null else root.getString(key).takeIf { it.isNotBlank() }
+
+    private fun inspectionDiagnostic(root: JSONObject): String = buildList {
+        nullableString(root, "diagnostic")?.let { add(it.take(MAX_DIAGNOSTIC_DETAIL_CHARS)) }
+        root.optJSONArray("warnings")?.let { warnings ->
+            for (index in 0 until minOf(warnings.length(), MAX_PATCH_FILES)) {
+                if (!warnings.isNull(index)) {
+                    warnings.optString(index).takeIf { it.isNotBlank() }
+                        ?.let { add(it.take(MAX_DIAGNOSTIC_DETAIL_CHARS)) }
+                }
+            }
+        }
+        if (root.optBoolean("recoveryPending", false)) {
+            add("중단된 작업이 남아 있습니다. 다음 작업 시작 전에 복구가 필요합니다.")
+        }
+    }.distinct().joinToString("\n").take(MAX_DIAGNOSTIC_DETAIL_CHARS)
+
+    private fun parseStrings(root: JSONObject, key: String): List<String> {
+        if (root.isNull(key)) return emptyList()
+        val values = root.getJSONArray(key)
+        require(values.length() <= MAX_PATCH_FILES) { "$key 항목이 너무 많습니다." }
+        return List(values.length()) { index ->
+            limitedText(values.getString(index), MAX_DIAGNOSTIC_DETAIL_CHARS, key)
+        }
     }
 
     fun safeRelativePath(value: String): String {
@@ -443,6 +606,10 @@ object PatchProtocol {
     private const val MAX_INSPECTION_REQUEST_BYTES = 256 * 1_024
     private const val MAX_DIAGNOSTIC_EVENTS = 512
     private const val MAX_DIAGNOSTIC_DETAIL_CHARS = 4_096
+    private val TARGET_STATES = setOf(
+        "ORIGINAL", "CURRENT_PATCH", "KNOWN_OLDER_PATCH", "UNKNOWN_MODIFIED",
+        "MISSING", "UNREADABLE", "AMBIGUOUS",
+    )
 }
 
 object TrustedUrls {

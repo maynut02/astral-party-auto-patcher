@@ -1,7 +1,10 @@
 package com.maynutlab.astralpatcher.ui
 
 import android.content.ComponentName
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
@@ -40,6 +43,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -92,6 +96,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.maynutlab.astralpatcher.BuildConfig
 import com.maynutlab.astralpatcher.IPatchService
 import com.maynutlab.astralpatcher.R
@@ -102,6 +107,8 @@ import com.maynutlab.astralpatcher.core.OriginalGameRelease
 import com.maynutlab.astralpatcher.core.PatchHttpClient
 import com.maynutlab.astralpatcher.core.PatchManifest
 import com.maynutlab.astralpatcher.core.PatchProtocol
+import com.maynutlab.astralpatcher.core.PatchTargetInspection
+import com.maynutlab.astralpatcher.core.ReleaseEntry
 import com.maynutlab.astralpatcher.core.selectGameTarget
 import com.maynutlab.astralpatcher.core.SHIZUKU_PACKAGE
 import com.maynutlab.astralpatcher.shizuku.PatchUserService
@@ -116,6 +123,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     private lateinit var controller: PatchController
@@ -136,6 +145,8 @@ class MainActivity : ComponentActivity() {
                     onPatch = controller::applyPatch,
                     onRestore = controller::restorePatch,
                     onLaunch = controller::launchGame,
+                    onConfirmOperation = controller::confirmOperation,
+                    onDismissOperation = controller::dismissOperation,
                 )
             }
         }
@@ -166,13 +177,20 @@ internal data class PatchUiState(
     val resourceNeedsDownload: Boolean = false,
     val releaseLabel: String = "한글패치 확인 중",
     val releaseStatus: String = "대기 중",
-    val releaseIndicator: StatusIndicator = StatusIndicator.PENDING,
+    val releaseIndicator: StatusIndicator = StatusIndicator.IN_PROGRESS,
     val latestPatchVersion: String? = null,
     val latestPatchUploadedAt: String? = null,
+    val latestPatchUploadStatus: String = "확인 중",
     val latestPatchStatus: String = "확인 중",
     val patchVersion: String? = null,
     val installedPatchVersion: String? = null,
     val availablePatcherVersion: String? = null,
+    val patcherUpdateStatus: String = "확인 중",
+    val patcherUpdateCheckedAt: Long? = null,
+    val latestRelease: ReleaseEntry? = null,
+    val compatiblePatchVersion: String? = null,
+    val confirmation: OperationConfirmation? = null,
+    val actionMessage: String? = null,
     val refreshing: Boolean = false,
     val busy: Boolean = false,
     val progressSection: ProgressSection? = null,
@@ -185,19 +203,24 @@ internal data class PatchUiState(
     val selectedInstalled: Boolean
         get() = selectedInstall != null
     val gameReady: Boolean
-        get() = selectedInstall?.let { install ->
-            if (selectedTarget.supportsOriginalInstall) install.installedFromPlay else true
-        } == true
+        get() = selectedInstalled
     val canPatch: Boolean
-        get() = gameReady && shizukuReady && resourceIndicator == StatusIndicator.COMPLETED &&
-            patchVersion != null && patchVersion != installedPatchVersion && !busy
+        get() = !busy
     val canRestore: Boolean
-        get() = gameReady && shizukuReady && installedPatchVersion != null && !busy
+        get() = !busy
     val canLaunch: Boolean
         get() = selectedInstalled && !busy
 }
 
+internal data class OperationConfirmation(
+    val operation: String,
+    val release: String,
+    val installedResource: String,
+    val reason: String,
+)
+
 internal enum class StatusIndicator {
+    NEUTRAL,
     PENDING,
     IN_PROGRESS,
     COMPLETED,
@@ -218,13 +241,18 @@ private class PatchController(private val activity: MainActivity) {
     private val updateExecutor = Executors.newSingleThreadExecutor()
     private var service: IPatchService? = null
     private var binding = false
-    private var catalog: CatalogIdentity? = null
-    private var manifest: PatchManifest? = null
+    private val refreshGate = LatestRequestGate()
+    @Volatile
+    private var stopped = false
+    private var pendingOperation: PreparedOperation? = null
+    private var updatePending = false
+    private var patchStatusBeforeWork: PatchInstallationStatus? = null
     @Volatile
     private var latestPatcher: MobilePatcherRelease? = null
     private var pendingSystemInstall: PendingInstall? = null
     @Volatile
     private var inspecting = false
+    private var refreshAfterWork = false
     @Volatile
     private var updateChecking = false
     private val preferences = activity.getSharedPreferences(PREFERENCES_NAME, android.content.Context.MODE_PRIVATE)
@@ -241,12 +269,16 @@ private class PatchController(private val activity: MainActivity) {
         ComponentName(activity, PatchUserService::class.java)
     )
         .daemon(false)
-        .tag("astral-cache-patcher-v6")
+        .tag("astral-cache-patcher-v8")
         .version(BuildConfig.VERSION_CODE)
         .processNameSuffix("patch")
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (stopped) {
+                runCatching { Shizuku.unbindUserService(serviceArgs, this, true) }
+                return
+            }
             service = IPatchService.Stub.asInterface(binder)
             binding = false
             appendLog("Shizuku patch 서비스에 연결했습니다.")
@@ -270,7 +302,23 @@ private class PatchController(private val activity: MainActivity) {
         if (requestCode == SHIZUKU_PERMISSION_REQUEST) refresh()
     }
 
+    private val packageChanges = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.data?.schemeSpecificPart !in GameTarget.supportedPackages) return
+            // Replacement removal is temporary; query after ADDED/REPLACED instead.
+            if (intent?.action == Intent.ACTION_PACKAGE_REMOVED &&
+                intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return
+            refresh()
+        }
+    }
+
     fun start() {
+        ContextCompat.registerReceiver(activity, packageChanges, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addDataScheme("package")
+        }, ContextCompat.RECEIVER_EXPORTED)
         Shizuku.addBinderReceivedListenerSticky(binderReceived)
         Shizuku.addBinderDeadListener(binderDead)
         Shizuku.addRequestPermissionResultListener(permissionResult)
@@ -278,6 +326,8 @@ private class PatchController(private val activity: MainActivity) {
     }
 
     fun stop() {
+        stopped = true
+        activity.unregisterReceiver(packageChanges)
         Shizuku.removeBinderReceivedListener(binderReceived)
         Shizuku.removeBinderDeadListener(binderDead)
         Shizuku.removeRequestPermissionResultListener(permissionResult)
@@ -294,19 +344,28 @@ private class PatchController(private val activity: MainActivity) {
         if (pending != null && activity.packageManager.canRequestPackageInstalls()) {
             pendingSystemInstall = null
             openSystemInstaller(pending.apk)
-        } else if (!state.busy) {
+        } else {
             refresh()
         }
     }
 
     fun manualRefresh() {
-        if (state.busy || state.refreshing) return
+        if (stopped) return
         state = state.copy(refreshing = true)
         refresh()
     }
 
     fun refresh() {
-        if (state.busy) return
+        if (stopped) return
+        refreshGate.request()
+        pendingOperation = null
+        state = state.copy(confirmation = null)
+        drainRefresh()
+    }
+
+    private fun drainRefresh() {
+        if (stopped) return
+        val ticket = refreshGate.startIfIdle(state.busy) ?: return
         val installs = installedGames()
         val selected = selectGameTarget(
             previous = preferredTarget,
@@ -314,9 +373,7 @@ private class PatchController(private val activity: MainActivity) {
         )
         if (selected != state.selectedTarget) persistSelectedTarget(selected)
         val selectedInstall = installs[selected]
-        val gameReady = selectedInstall?.let { install ->
-            if (selected.supportsOriginalInstall) install.installedFromPlay else true
-        } == true
+        val gameReady = selectedInstall != null
         val shizukuInstalled = isPackageInstalled(SHIZUKU_PACKAGE)
         val binderReady = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
         val permissionGranted = binderReady &&
@@ -358,12 +415,12 @@ private class PatchController(private val activity: MainActivity) {
             resourceIndicator = if (gameReady && permissionGranted) {
                 StatusIndicator.IN_PROGRESS
             } else {
-                StatusIndicator.PENDING
+                StatusIndicator.NEUTRAL
             },
             resourceNeedsDownload = false,
             releaseLabel = when {
-                !gameReady -> "한글패치 확인 실패"
-                !permissionGranted -> "한글패치 확인 실패"
+                !gameReady -> "한글패치 확인 대기"
+                !permissionGranted -> "한글패치 확인 대기"
                 else -> "한글패치 확인 중"
             },
             releaseStatus = when {
@@ -374,34 +431,29 @@ private class PatchController(private val activity: MainActivity) {
             releaseIndicator = if (gameReady && permissionGranted) {
                 StatusIndicator.IN_PROGRESS
             } else {
-                StatusIndicator.PENDING
+                StatusIndicator.NEUTRAL
             },
             latestPatchVersion = null,
             latestPatchUploadedAt = null,
+            latestPatchUploadStatus = "확인 중",
             latestPatchStatus = "확인 중",
             patchVersion = null,
             installedPatchVersion = null,
+            latestRelease = null,
+            compatiblePatchVersion = null,
         )
-        catalog = null
-        manifest = null
         checkPatcherUpdate()
-        checkLatestPatchVersion(selected, selectedInstall?.version)
-        if (!permissionGranted) return
-        if (service == null) {
+        if (permissionGranted && service == null) {
             bindPatchService()
-            return
         }
-        if (!gameReady) {
-            maybeFinishManualRefresh()
-            return
-        }
-        inspectAndResolve(selected)
+        inspectAndResolve(selected, selectedInstall, ticket, service.takeIf { permissionGranted && gameReady })
     }
 
     private fun maybeFinishManualRefresh() {
         if (!state.refreshing) return
         val statusStillUpdating =
             state.latestPatchStatus == "확인 중" ||
+                (state.latestPatchVersion != null && state.latestPatchUploadStatus == "확인 중") ||
                 state.resourceIndicator == StatusIndicator.IN_PROGRESS ||
                 state.releaseIndicator == StatusIndicator.IN_PROGRESS
         if (statusStillUpdating || updateChecking || binding || inspecting) return
@@ -414,8 +466,6 @@ private class PatchController(private val activity: MainActivity) {
         if (!installed && !target.selectableWhenMissing) return
         persistSelectedTarget(target)
         state = state.copy(selectedTarget = target)
-        catalog = null
-        manifest = null
         refresh()
     }
 
@@ -451,6 +501,10 @@ private class PatchController(private val activity: MainActivity) {
     fun handleGame() {
         val target = state.selectedTarget
         if (!target.supportsOriginalInstall) return
+        if (android.os.Process.myUid() / 100_000 != 0) {
+            state = state.copy(actionMessage = "원본 게임 설치는 기본 사용자 프로필에서 실행해 주세요.")
+            return
+        }
         if (state.gameInstalls[target]?.installedFromPlay == true) {
             launchGame()
             return
@@ -477,7 +531,7 @@ private class PatchController(private val activity: MainActivity) {
             var installStarted = false
             var downloaded = emptyList<File>()
             try {
-                require(patchService.getServiceInfo().startsWith("AstralPatchService/6 ")) {
+                require(patchService.getServiceInfo().startsWith("AstralPatchService/8 ")) {
                     "지원하지 않는 게임 설치 서비스입니다."
                 }
                 val release = PatchHttpClient.getLatestOriginalGameRelease()
@@ -494,6 +548,7 @@ private class PatchController(private val activity: MainActivity) {
                 verifyOriginalGameApks(downloaded, release)
                 appendLog("원본 게임 APK 해시, packageName, versionCode 및 Play 인증서를 확인했습니다.")
 
+                require(!stopped && !Thread.currentThread().isInterrupted) { "작업이 취소되었습니다." }
                 patchService.beginGameInstall(installId, downloaded.size)
                 installStarted = true
                 downloaded.forEachIndexed { index, apk ->
@@ -517,6 +572,7 @@ private class PatchController(private val activity: MainActivity) {
                 installStarted = false
                 verifyInstalledOriginalGame(release)
                 main.post {
+                    if (stopped) return@post
                     appendLog("원본 게임 설치 완료 · $result")
                     setIdle()
                     refresh()
@@ -543,6 +599,10 @@ private class PatchController(private val activity: MainActivity) {
                 apk = downloadedApk
                 verifyShizukuApk(downloadedApk)
                 main.post {
+                    if (stopped) {
+                        downloadedApk.delete()
+                        return@post
+                    }
                     appendLog("Shizuku ${latest.version} APK 다운로드 및 검증을 완료했습니다.")
                     setIdle()
                     requestSystemInstall(downloadedApk, InstallTarget.SHIZUKU)
@@ -575,6 +635,10 @@ private class PatchController(private val activity: MainActivity) {
                 apk = downloadedApk
                 verifyMobilePatcherApk(downloadedApk, target)
                 main.post {
+                    if (stopped) {
+                        downloadedApk.delete()
+                        return@post
+                    }
                     appendLog("Android 패처 ${target.version} APK 다운로드 및 검증을 완료했습니다.")
                     setIdle()
                     requestSystemInstall(downloadedApk, InstallTarget.PATCHER)
@@ -586,225 +650,205 @@ private class PatchController(private val activity: MainActivity) {
         }
     }
 
-    fun applyPatch() {
+    fun applyPatch() = requestOperation("PATCH")
+
+    fun restorePatch() = requestOperation("RESTORE")
+
+    private fun requestOperation(operation: String) {
+        if (state.busy) return
+        val install = state.selectedInstall
+        if (install == null) {
+            state = state.copy(actionMessage = "선택한 게임을 먼저 설치해 주세요.")
+            if (state.selectedTarget.supportsOriginalInstall) handleGame()
+            return
+        }
+        if (install.userId != 0) {
+            state = state.copy(actionMessage = "현재 패처는 기본 사용자 프로필에서만 파일 작업을 지원합니다. 기본 프로필에서 게임과 패처를 실행해 주세요.")
+            return
+        }
+        if (!state.shizukuReady) {
+            state = state.copy(actionMessage = "Shizuku를 시작하고 권한을 허용한 뒤 다시 시도해 주세요.")
+            handleShizuku()
+            return
+        }
+        if (service == null) {
+            state = state.copy(actionMessage = "Shizuku 서비스에 연결 중입니다. 연결 후 다시 시도해 주세요.")
+            bindPatchService()
+            return
+        }
+        prepareLatestOperation(operation)
+    }
+
+    fun dismissOperation() {
+        pendingOperation = null
+        state = state.copy(confirmation = null)
+        if (refreshAfterWork) {
+            refreshAfterWork = false
+            refresh()
+        }
+    }
+
+    private fun prepareLatestOperation(operation: String) {
         val target = state.selectedTarget
-        val targetManifest = manifest ?: return
-        val targetCatalog = catalog ?: return
+        val install = state.selectedInstall ?: return
         val patchService = service ?: return
-        require(targetManifest.route == target.route) { "선택한 게임과 patch route가 다릅니다." }
-        state = state.copy(releaseIndicator = StatusIndicator.IN_PROGRESS)
-        setBusy("패치 정보를 검증하는 중", 0f, ProgressSection.PATCH)
+        val ticket = refreshGate.generation
+        state = state.copy(confirmation = null, actionMessage = null)
+        setBusy("최신 한글패치와 대상 파일을 확인하는 중", 0f, ProgressSection.PATCH)
         executor.execute {
-            val transactionId = UUID.randomUUID().toString()
-            var transactionStarted = false
-            var diagnosticsCursor = 0
-            val payloads = mutableListOf<File>()
-            val originals = mutableListOf<File>()
-            val fileCount = targetManifest.files.size.coerceAtLeast(1)
-            fun overallPatchProgress(fileIndex: Int, fileProgress: Float): Float =
-                0.05f + ((fileIndex + fileProgress.coerceIn(0f, 1f)) / fileCount) * 0.9f
             try {
-                val serviceInfo = patchService.getServiceInfo()
-                appendLog(
-                    "[CLIENT] patch 시작 · app=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) " +
-                        "transaction=$transactionId"
-                )
-                appendLog("[CLIENT] service=$serviceInfo")
-                appendLog(
-                    "[CLIENT] manifest · patch=${targetManifest.patchVersion} " +
-                        "game=${targetManifest.gameVersion} revision=${targetManifest.revision} " +
-                        "catalog=${targetManifest.catalogHash} files=${targetManifest.files.size}"
-                )
-                val readiness = PatchProtocol.parseTargetInspection(
-                    patchService.inspectPatchTargets(
-                        target.packageName,
-                        PatchProtocol.createTargetInspectionRequest(targetManifest),
-                    )
-                )
-                appendLog(
-                    "[CLIENT] 리소스 사전검사 · total=${readiness.total} ready=${readiness.ready} " +
-                        "missing=${readiness.missing} incompatible=${readiness.incompatible}"
-                )
-                require(readiness.isReady) {
-                    "게임 리소스가 변경되었거나 필요한 파일이 없습니다. 새로고침 후 다시 시도해 주세요."
+                requireService(patchService)
+                // Re-read the index for every action. Never prefer a cached or catalog-matched older patch.
+                val index = PatchHttpClient.getIndex(::appendLog)
+                val release = requireNotNull(PatchProtocol.latestReleaseForRoute(index, target.route)) {
+                    "이 게임의 최신 한글패치 리소스가 없습니다."
                 }
-                appendLog("[CLIENT] beginPatch 호출 · transaction=$transactionId")
-                transactionStarted = true
-                patchService.beginPatch(transactionId, target.packageName, targetCatalog.catalogHash)
-                appendLog("[CLIENT] beginPatch 반환")
-                diagnosticsCursor = appendServiceDiagnostics(
-                    patchService,
-                    target,
-                    transactionId,
-                    diagnosticsCursor,
-                    includeSnapshot = true,
-                )
-                updateBusy("패치 작업 준비 완료", 0.05f)
-                targetManifest.files.forEachIndexed { index, item ->
-                    val fileLabel = "${index + 1}/${targetManifest.files.size}"
-                    val original = PatchHttpClient.downloadOriginal(
-                        activity.cacheDir,
-                        item,
-                        index,
-                    ) { percent ->
-                        updateBusy(
-                            "원본 파일 $fileLabel 다운로드",
-                            overallPatchProgress(index, percent / 100f * 0.35f),
-                        )
-                    }
-                    originals += original
-                    ParcelFileDescriptor.open(original, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                        patchService.stageOriginal(
-                            transactionId,
-                            target.packageName,
-                            descriptor,
-                            item.sourceSize,
-                            item.sourceSha256,
-                            item.relativePath,
-                        )
-                    }
-                    updateBusy(
-                        "원본 파일 $fileLabel 검증 및 보관 완료",
-                        overallPatchProgress(index, 0.35f),
-                    )
-                    appendLog("[CLIENT] 파일 $fileLabel 릴리즈 원본 검증 및 보관 완료")
-                    appendLog(
-                        "[CLIENT] 파일 $fileLabel 다운로드 시작 · path=${item.relativePath} " +
-                            "downloadBytes=${item.downloadSize} payloadBytes=${item.payloadSize} " +
-                            "payloadSha256=${item.payloadSha256} sourceBytes=${item.sourceSize} " +
-                            "sourceSha256=${item.sourceSha256}"
-                    )
-                    updateBusy(
-                        "파일 $fileLabel 다운로드 및 검증",
-                        overallPatchProgress(index, 0.35f),
-                    )
-                    val payload = PatchHttpClient.downloadPayload(
-                        activity.cacheDir,
-                        item,
-                        index,
-                    ) { percent ->
-                        updateBusy(
-                            "파일 $fileLabel 다운로드",
-                            overallPatchProgress(index, 0.35f + percent / 100f * 0.5f),
-                        )
-                    }
-                    payloads += payload
-                    appendLog("[CLIENT] 파일 $fileLabel 다운로드 검증 완료 · localBytes=${payload.length()}")
-                    updateBusy(
-                        "파일 $fileLabel 적용",
-                        overallPatchProgress(index, 0.9f),
-                    )
-                    appendLog("[CLIENT] 파일 $fileLabel applyFile 호출 · path=${item.relativePath}")
-                    val applyResultJson = ParcelFileDescriptor.open(payload, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                        patchService.applyFile(
-                            transactionId,
-                            target.packageName,
-                            descriptor,
-                            item.payloadSize,
-                            item.payloadSha256,
-                            item.sourceSize,
-                            item.sourceSha256,
-                            item.relativePath,
-                        )
-                    }
-                    val applyResult = PatchProtocol.parseApplyFileResult(applyResultJson)
-                    appendLog(
-                        if (applyResult.ok) {
-                            "[CLIENT] 파일 $fileLabel applyFile 성공"
-                        } else {
-                            "[CLIENT] 파일 $fileLabel applyFile 실패 · ${applyResult.error}"
-                        }
-                    )
-                    diagnosticsCursor = appendServiceDiagnostics(
-                        patchService,
-                        target,
-                        transactionId,
-                        diagnosticsCursor,
-                        includeSnapshot = true,
-                    )
-                    require(applyResult.ok) {
-                        applyResult.error.ifBlank { "patch 파일 적용에 실패했습니다." }
-                    }
-                    updateBusy(
-                        "파일 $fileLabel 적용 완료",
-                        overallPatchProgress(index, 1f),
-                    )
-                }
-                appendLog("[CLIENT] commitPatch 호출")
-                updateBusy("패치 적용 결과를 저장하는 중", 0.98f)
-                patchService.commitPatch(
-                    transactionId,
+                val identity = PatchProtocol.parseInspection(patchService.inspectGame(target.packageName))
+                val selectedManifest = PatchProtocol.parseManifest(PatchHttpClient.getManifest(release, ::appendLog), release, target.route)
+                val inspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
                     target.packageName,
-                    targetManifest.gameVersion,
-                    targetManifest.catalogHash,
-                    targetManifest.patchVersion,
-                )
-                transactionStarted = false
-                appendLog("[CLIENT] commitPatch 반환")
-                updateBusy("한글패치 적용 완료", 1f)
-                diagnosticsCursor = appendServiceDiagnostics(
-                    patchService,
-                    target,
-                    transactionId,
-                    diagnosticsCursor,
-                    includeSnapshot = true,
-                )
+                    PatchProtocol.createTargetInspectionRequest(selectedManifest, release, operation, install.toJson()),
+                ))
+                logInspection(inspection)
+                require(inspection.canWrite && inspection.planJson != null) {
+                    inspectionFailure(inspection)
+                }
+                val reason = resourceVersionMismatch(inspection, identity.gameVersion.takeIf(String::isNotBlank) ?: install.version, release)
+                val compatible = runCatching {
+                    PatchProtocol.resolveRelease(index, identity.copy(catalogHash = inspection.catalogHash.orEmpty()), target.route)
+                }.getOrNull()
+                val prepared = PreparedOperation(target, install, release, selectedManifest, inspection, operation, ticket)
                 main.post {
-                    appendLog("${targetManifest.patchVersion} 적용을 완료했습니다.")
-                    setIdle()
-                    refresh()
+                    if (stopped) return@post
+                    if (!refreshGate.isCurrent(ticket) || state.selectedTarget != target || !install.sameInstallation(installedGame(target))) {
+                        state = state.copy(actionMessage = "확인 중 게임 또는 조회 상태가 바뀌었습니다. 다시 시도해 주세요.")
+                        setIdle()
+                        refresh()
+                        return@post
+                    }
+                    state = state.copy(
+                        latestRelease = release,
+                        latestPatchVersion = release.patchVersion,
+                        latestPatchUploadedAt = release.uploadedAt,
+                        latestPatchUploadStatus = if (release.uploadedAt == null) "확인 중" else "확인 완료",
+                        latestPatchStatus = "배포 조회 완료",
+                        patchVersion = release.patchVersion,
+                        compatiblePatchVersion = compatible?.patchVersion,
+                    )
+                    if (release.uploadedAt == null) checkPatchUploadedAt(release, target, install, ticket)
+                    if (reason == null) {
+                        executeOperation(prepared, patchService)
+                    } else {
+                        pendingOperation = prepared
+                        state = state.copy(confirmation = OperationConfirmation(
+                            operation, release.patchVersion, compatible?.patchVersion ?: "확인할 수 없는 배포", reason,
+                        ))
+                        setIdle()
+                    }
                 }
             } catch (error: Exception) {
-                main.post { state = state.copy(releaseIndicator = StatusIndicator.ERROR) }
-                appendLog("[CLIENT] patch 예외 · ${describeError(error)}")
-                diagnosticsCursor = appendServiceDiagnostics(
-                    patchService,
-                    target,
-                    transactionId,
-                    diagnosticsCursor,
-                    includeSnapshot = true,
-                )
-                if (transactionStarted) {
-                    appendLog("[CLIENT] rollbackPatch 호출")
-                    runCatching { patchService.rollbackPatch(transactionId, target.packageName) }
-                        .onSuccess { appendLog("[CLIENT] rollbackPatch 반환") }
-                        .onFailure { rollbackError ->
-                            appendLog("[CLIENT] rollbackPatch 예외 · ${describeError(rollbackError)}")
-                        }
-                    appendServiceDiagnostics(
-                        patchService,
-                        target,
-                        transactionId,
-                        diagnosticsCursor,
-                        includeSnapshot = true,
-                    )
-                }
-                showError("한글패치 적용에 실패했습니다.", error)
-            } finally {
-                payloads.forEach(File::delete)
-                originals.forEach(File::delete)
+                showError("작업 준비에 실패했습니다.", error)
             }
         }
     }
 
-    fun restorePatch() {
-        val target = state.selectedTarget
-        val patchService = service ?: return
-        state = state.copy(releaseIndicator = StatusIndicator.IN_PROGRESS)
-        setBusy("원본 리소스를 복원하는 중", 0f, ProgressSection.PATCH)
+    fun confirmOperation() {
+        val prepared = pendingOperation ?: return
+        pendingOperation = null
+        state = state.copy(confirmation = null)
+        val patchService = service
+        if (!refreshGate.isCurrent(prepared.ticket) || state.selectedTarget != prepared.target ||
+            state.latestRelease != prepared.release || !prepared.install.sameInstallation(installedGame(prepared.target)) || patchService == null) {
+            state = state.copy(actionMessage = "확인 후 게임 또는 최신 한글패치 정보가 바뀌었습니다. 다시 시도해 주세요.")
+            refresh()
+            return
+        }
+        executeOperation(prepared, patchService)
+    }
+
+    private fun executeOperation(prepared: PreparedOperation, patchService: IPatchService) {
+        val (target, install, release, targetManifest, inspection, operation) = prepared
+        val restoring = operation == "RESTORE"
+        setBusy(if (restoring) "검증된 원본을 다운로드하는 중" else "최신 한글패치를 다운로드하는 중", 0f, ProgressSection.PATCH)
         executor.execute {
+            val transactionId = UUID.randomUUID().toString()
+            var transactionStarted = false
+            var cursor = 0
+            val payloads = mutableListOf<File>()
             try {
-                val result = patchService.restorePatch(target.packageName)
+                requireService(patchService)
+                // Complete every network transfer and hash check before starting any game-file writes.
+                targetManifest.files.forEachIndexed { index, item ->
+                    val label = "${index + 1}/${targetManifest.files.size}"
+                    val onProgress: (Int) -> Unit = { percent ->
+                        updateBusy("${if (restoring) "원본" else "패치"} $label 다운로드 및 검증",
+                            (index + percent / 100f) / targetManifest.files.size * 0.75f)
+                    }
+                    payloads += if (restoring) PatchHttpClient.downloadOriginal(activity.cacheDir, item, index, onProgress, ::appendLog)
+                        else PatchHttpClient.downloadPayload(activity.cacheDir, item, index, onProgress, ::appendLog)
+                }
+                appendLog("[CLIENT] 모든 다운로드·압축 해제·해시 검증 완료. 게임 파일 작업을 준비합니다.")
+                require(!stopped && !Thread.currentThread().isInterrupted) { "작업이 취소되었습니다." }
+                require(install.sameInstallation(installedGame(target, strict = true))) {
+                    "다운로드 중 설치 게임이 변경되었습니다. 다시 시도해 주세요."
+                }
+                appendLog("${release.patchVersion} · $operation · manifest=${release.manifestSha256}")
+                transactionStarted = true
+                patchService.beginPlannedPatch(transactionId, target.packageName, requireNotNull(inspection.planJson))
+                targetManifest.files.forEachIndexed { index, item ->
+                    require(!stopped && !Thread.currentThread().isInterrupted) { "작업이 취소되었습니다." }
+                    updateBusy("${if (restoring) "원본 복구" else "한글패치 적용"} ${index + 1}/${targetManifest.files.size}",
+                        0.75f + index.toFloat() / targetManifest.files.size * 0.2f)
+                    val file = payloads[index]
+                    val result = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+                        PatchProtocol.parseApplyFileResult(patchService.applyFile(transactionId, target.packageName,
+                            descriptor, if (restoring) item.sourceSize else item.payloadSize,
+                            if (restoring) item.sourceSha256 else item.payloadSha256,
+                            item.sourceSize, item.sourceSha256, item.relativePath))
+                    }
+                    require(result.ok) { result.error }
+                    cursor = appendServiceDiagnostics(patchService, target, transactionId, cursor, false)
+                }
+                patchService.commitPatch(transactionId, target.packageName, targetManifest.gameVersion,
+                    targetManifest.catalogHash, targetManifest.patchVersion)
+                transactionStarted = false
                 main.post {
-                    appendLog(result)
+                    if (stopped) return@post
+                    appendLog(if (restoring) "${release.patchVersion} 대상 원본 ${targetManifest.files.size}개를 복구했습니다."
+                        else "${release.patchVersion} 설치를 완료했습니다.")
                     setIdle()
                     refresh()
                 }
             } catch (error: Exception) {
-                main.post { state = state.copy(releaseIndicator = StatusIndicator.ERROR) }
-                showError("원본 복원에 실패했습니다.", error)
+                if (transactionStarted) {
+                    runCatching { patchService.rollbackPatch(transactionId, target.packageName) }
+                        .onFailure { appendLog("자동 롤백을 완료하지 못했습니다. 다음 작업 전에 복구가 필요합니다. ${describeError(it)}") }
+                    appendServiceDiagnostics(patchService, target, transactionId, cursor, true)
+                }
+                showError(if (restoring) "원본 복구에 실패했습니다." else "한글패치 설치에 실패했습니다.", error)
+            } finally {
+                payloads.forEach(File::delete)
             }
         }
+    }
+
+    private fun requireService(patchService: IPatchService) {
+        require(patchService.getServiceInfo().startsWith("AstralPatchService/8 ")) {
+            "패처와 Shizuku 서비스 버전이 다릅니다. 앱을 다시 열어 서비스에 연결해 주세요."
+        }
+    }
+
+    private fun inspectionFailure(result: PatchTargetInspection): String = buildList {
+        if (result.missing > 0) add("대상 ${result.missing}개가 없습니다. 게임에서 리소스를 다운로드한 후 다시 시도해 주세요.")
+        if (result.unreadable > 0) add("대상 ${result.unreadable}개에 접근할 수 없습니다. Shizuku 권한과 저장소 접근을 확인해 주세요.")
+        if (result.ambiguous > 0) add("대상 ${result.ambiguous}개의 경로가 중복됩니다. 실제 사용 경로를 확정할 수 없어 쓰기를 중단합니다.")
+    }.joinToString("\n").ifBlank { "모든 대상 파일의 경로를 확정하지 못했습니다. 새로고침 후 다시 시도해 주세요." }
+
+    private fun logInspection(result: PatchTargetInspection) {
+        result.files.forEach { file ->
+            appendLog("${file.path} · ${file.state} · ${file.actualPath} · ${file.size} bytes · ${file.sha256} ${file.error}")
+        }
+        result.warnings.forEach(::appendLog)
     }
 
     fun launchGame() {
@@ -826,220 +870,206 @@ private class PatchController(private val activity: MainActivity) {
             }
     }
 
-    private fun inspectAndResolve(target: GameTarget) {
-        val patchService = service ?: return
-        if (inspecting) return
+    private fun inspectAndResolve(target: GameTarget, install: GameInstall?, ticket: Long, patchService: IPatchService?) {
         inspecting = true
         executor.execute {
-            var inspected: CatalogIdentity? = null
-            var checkingTargets = false
-            try {
-                require(patchService.getServiceInfo().startsWith("AstralPatchService/6 ")) {
-                    "지원하지 않는 patch 서비스입니다."
+            var identity: CatalogIdentity? = null
+            var inspectionError: String? = null
+            var releaseError: String? = null
+            var releases = emptyList<ReleaseEntry>()
+            var latest: ReleaseEntry? = null
+            var compatible: ReleaseEntry? = null
+            var resolvedManifest: PatchManifest? = null
+            var targetInspection: PatchTargetInspection? = null
+            var installedManifest: PatchManifest? = null
+            var installedInspection: PatchTargetInspection? = null
+            if (patchService != null && install?.userId == 0) {
+                runCatching {
+                    requireService(patchService)
+                    PatchProtocol.parseInspection(patchService.inspectGame(target.packageName))
+                }.onSuccess { identity = it }
+                    .onFailure { inspectionError = it.message ?: it.javaClass.simpleName }
+            }
+            runCatching {
+                val index = PatchHttpClient.getIndex(::appendLog)
+                releases = PatchProtocol.releasesForRoute(index, target.route)
+                latest = PatchProtocol.latestReleaseForRoute(index, target.route)
+                val observed = identity
+                if (observed != null && observed.gameVersion == install?.version && observed.catalogHash.isNotBlank()) {
+                    // Catalog matching describes installed resources; it never selects the download target.
+                    compatible = runCatching { PatchProtocol.resolveRelease(index, observed, target.route) }.getOrNull()
                 }
-                val catalogIdentity = PatchProtocol.parseInspection(patchService.inspectGame(target.packageName))
-                inspected = catalogIdentity
-                val index = PatchHttpClient.getIndex()
-                val resolved = PatchProtocol.resolveRelease(index, catalogIdentity, target.route)
-                if (state.selectedTarget != target) return@execute
-                catalog = catalogIdentity
-                if (resolved == null) {
-                    manifest = null
-                    main.post {
-                        if (state.selectedTarget != target) return@post
-                        state = state.copy(
-                            resourceLabel = "리소스 확인 실패",
-                            resourceStatus = "패치 대상 리소스를 확인할 수 없습니다",
-                            resourceIndicator = StatusIndicator.PENDING,
-                            resourceNeedsDownload = false,
-                            releaseLabel = if (catalogIdentity.installedPatchVersion != null) {
-                                "한글패치 확인 필요"
-                            } else {
-                                "한글패치 미설치"
-                            },
-                            releaseStatus = catalogIdentity.installedPatchVersion?.let { "$it • 호환되지 않는 패치" }
-                                ?: "-",
-                            releaseIndicator = StatusIndicator.PENDING,
-                            patchVersion = null,
-                            installedPatchVersion = catalogIdentity.installedPatchVersion,
-                        )
+                val choice = latest
+                if (choice != null && patchService != null && install?.userId == 0) {
+                    resolvedManifest = PatchProtocol.parseManifest(PatchHttpClient.getManifest(choice, ::appendLog), choice, target.route)
+                    targetInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(target.packageName,
+                        PatchProtocol.createTargetInspectionRequest(requireNotNull(resolvedManifest), choice, "PATCH", install.toJson())))
+                    installedManifest = resolvedManifest
+                    installedInspection = targetInspection
+                    // Compare older translation manifests only when the latest files cannot prove the state.
+                    val primary = PatchStatusObservation(requireNotNull(resolvedManifest), requireNotNull(targetInspection))
+                    val compatibleObservation = compatible?.takeIf { it != choice }?.let { installedRelease ->
+                        runCatching {
+                            val previousManifest = PatchProtocol.parseManifest(
+                                PatchHttpClient.getManifest(installedRelease, ::appendLog), installedRelease, target.route,
+                            )
+                            val previousInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
+                                target.packageName, PatchProtocol.createTargetInspectionRequest(
+                                    previousManifest, installedRelease, "PATCH", install.toJson(),
+                                ),
+                            ))
+                            PatchStatusObservation(previousManifest, previousInspection)
+                        }.onFailure { appendLog("설치된 한글패치 상태 확인: ${describeError(it)}") }.getOrNull()
                     }
-                    return@execute
-                }
-
-                val resolvedManifest = PatchProtocol.parseManifest(
-                    PatchHttpClient.getManifest(resolved),
-                    resolved,
-                    target.route,
-                )
-                checkingTargets = true
-                val targetInspection = PatchProtocol.parseTargetInspection(
-                    patchService.inspectPatchTargets(
-                        target.packageName,
-                        PatchProtocol.createTargetInspectionRequest(resolvedManifest),
+                    val statusObservation = selectPatchStatusObservation(
+                        primary, compatibleObservation, observed, releases,
+                        load = { previousRelease ->
+                            val previousManifest = PatchProtocol.parseManifest(
+                                PatchHttpClient.getManifest(previousRelease, ::appendLog), previousRelease, target.route,
+                            )
+                            val previousInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
+                                target.packageName, PatchProtocol.createTargetInspectionRequest(
+                                    previousManifest, previousRelease, "PATCH", install.toJson(),
+                                ),
+                            ))
+                            PatchStatusObservation(previousManifest, previousInspection)
+                        },
+                        onFailure = { release, error -> appendLog("구버전 설치 확인 (${release.patchVersion}): ${describeError(error)}") },
                     )
-                )
-                val ready = targetInspection.isReady
-                if (state.selectedTarget != target) return@execute
-                manifest = resolvedManifest
-                main.post {
-                    if (state.selectedTarget != target) return@post
-                    val installedPatch = catalogIdentity.installedPatchVersion
-                    state = state.copy(
-                        resourceLabel = when {
-                            ready -> "리소스 확인 완료"
-                            targetInspection.incompatible > 0 -> "리소스 업데이트 필요"
-                            else -> "리소스 확인 실패"
-                        },
-                        resourceStatus = when {
-                            ready -> "패치 대상 리소스 ${targetInspection.total}개를 확인했습니다"
-                            targetInspection.incompatible > 0 && targetInspection.missing > 0 ->
-                                "${targetInspection.incompatible}개의 리소스가 일치하지 않습니다\n${targetInspection.missing}개의 리소스가 누락되었습니다"
-                            targetInspection.incompatible > 0 ->
-                                "${targetInspection.incompatible}개의 리소스가 일치하지 않습니다"
-                            else -> "패치 대상 리소스 ${targetInspection.missing}개를 확인할 수 없습니다"
-                        },
-                        resourceIndicator = if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
-                        resourceNeedsDownload = targetInspection.missing > 0 || targetInspection.incompatible > 0,
-                        releaseLabel = when {
-                            installedPatch == null -> "한글패치 미설치"
-                            installedPatch == resolved.patchVersion -> "한글패치 설치됨"
-                            else -> "한글패치 업데이트 필요"
-                        },
-                        releaseStatus = when {
-                            installedPatch == null -> "-"
-                            installedPatch == resolved.patchVersion -> "$installedPatch • 최신 버전"
-                            else -> installedPatch
-                        },
-                        releaseIndicator = if (installedPatch == resolved.patchVersion) {
-                            StatusIndicator.COMPLETED
-                        } else {
-                            StatusIndicator.PENDING
-                        },
-                        latestPatchVersion = resolved.patchVersion,
-                        latestPatchUploadedAt = resolved.uploadedAt,
-                        latestPatchStatus = "확인 완료",
-                        patchVersion = resolved.patchVersion,
-                        installedPatchVersion = installedPatch,
-                    )
+                    installedManifest = statusObservation.manifest
+                    installedInspection = statusObservation.inspection
                 }
-            } catch (error: Exception) {
-                val needsDownload = isResourceNotReady(error)
-                val currentCatalog = inspected
-                main.post {
-                    if (state.selectedTarget != target) return@post
-                    state = state.copy(
-                        resourceLabel = if (needsDownload) {
-                            "리소스 다운로드 필요"
-                        } else {
-                            "리소스 확인 실패"
-                        },
-                        resourceStatus = when {
-                            needsDownload -> "게임을 실행해 리소스를 다운로드해 주세요"
-                            currentCatalog != null && !checkingTargets -> "패치 대상 리소스를 확인할 수 없습니다"
-                            else -> "리소스를 확인할 수 없습니다"
-                        },
-                        resourceIndicator = if (needsDownload) {
-                            StatusIndicator.PENDING
-                        } else {
-                            StatusIndicator.ERROR
-                        },
-                        resourceNeedsDownload = needsDownload,
-                        releaseLabel = "한글패치 확인 실패",
-                        releaseStatus = if (currentCatalog != null && !checkingTargets) {
-                            "패치 정보를 확인할 수 없습니다"
-                        } else {
-                            "리소스가 설치되지 않았습니다"
-                        },
-                        releaseIndicator = if (needsDownload) {
-                            StatusIndicator.PENDING
-                        } else {
-                            StatusIndicator.ERROR
-                        },
-                        patchVersion = null,
-                        installedPatchVersion = currentCatalog?.installedPatchVersion,
-                    )
-                    appendLog("패치 상태 확인에 실패했습니다. ${error.message ?: error.javaClass.simpleName}")
-                    setIdle()
+            }.onFailure { releaseError = it.message ?: it.javaClass.simpleName }
+            val resultIdentity = identity
+            val resultInspection = targetInspection
+            val resultManifest = installedManifest ?: resolvedManifest
+            val resultInstalledInspection = installedInspection ?: targetInspection
+            val resultReleases = releases
+            val resultLatest = latest
+            val resultCompatible = compatible
+            val error = releaseError ?: inspectionError
+            main.post {
+                if (!stopped && refreshGate.isCurrent(ticket) && state.selectedTarget == target && !state.busy) {
+                    if (!sameInstallationSnapshot(install, installedGame(target))) {
+                        refresh()
+                    } else {
+                        val ready = resultInspection?.isReady == true
+                        val unavailableReason = when {
+                            install == null -> "게임을 설치한 뒤 한글패치를 적용해 주세요"
+                            install.userId != 0 -> "기본 사용자 프로필에서 실행해 주세요"
+                            patchService == null -> "Shizuku 연결과 권한을 확인해 주세요"
+                            else -> null
+                        }
+                        val patchStatus = resolvePatchInstallationStatus(
+                            resultIdentity, resultInstalledInspection, resultManifest, install?.version,
+                            resultLatest, resultReleases, unavailableReason, error,
+                        )
+                        state = state.copy(
+                            resourceLabel = when {
+                                ready -> "리소스 확인 완료"
+                                resultInspection?.missing?.let { it > 0 } == true -> "리소스 다운로드 필요"
+                                resultInspection?.incompatible?.let { it > 0 } == true -> "리소스 호환성 확인 필요"
+                                resultInspection != null -> "리소스 경로 확인 필요"
+                                else -> "리소스 확인 불가"
+                            },
+                            resourceStatus = when {
+                                ready -> "대상 파일 ${resultInspection.total}개를 확인했습니다"
+                                resultInspection?.canWrite == true -> "기존 파일을 확인했습니다. 최신 한글패치로 교체할 수 있습니다."
+                                resultInspection != null -> inspectionFailure(resultInspection)
+                                install?.userId != null && install.userId != 0 -> "기본 사용자 프로필에서 실행해 주세요"
+                                error != null -> error
+                                patchService == null -> "게임 설치 및 Shizuku 연결 후 파일을 확인할 수 있습니다"
+                                else -> "카탈로그를 확인하지 못했습니다. 설치 시 최신 리소스를 다시 확인합니다."
+                            },
+                            resourceIndicator = when {
+                                ready -> StatusIndicator.COMPLETED
+                                resultInspection?.unreadable?.let { it > 0 } == true -> StatusIndicator.ERROR
+                                patchService == null || install == null -> StatusIndicator.NEUTRAL
+                                resultInspection == null && error != null -> StatusIndicator.ERROR
+                                else -> StatusIndicator.PENDING
+                            },
+                            resourceNeedsDownload = resultInspection?.missing?.let { it > 0 } == true,
+                            releaseLabel = patchStatus.label,
+                            releaseStatus = patchStatus.description,
+                            releaseIndicator = patchStatus.indicator,
+                            latestPatchVersion = resultLatest?.patchVersion,
+                            latestPatchUploadedAt = resultLatest?.uploadedAt,
+                            latestPatchUploadStatus = when {
+                                resultLatest == null -> "버전 확인 후 표시"
+                                resultLatest.uploadedAt == null -> "확인 중"
+                                else -> "확인 완료"
+                            },
+                            latestPatchStatus = if (resultLatest != null) "배포 조회 완료" else if (releaseError != null) "조회 실패" else "해당 게임 배포 없음",
+                            latestRelease = resultLatest,
+                            compatiblePatchVersion = resultCompatible?.patchVersion,
+                            patchVersion = resultLatest?.patchVersion,
+                            installedPatchVersion = patchStatus.installedPatchVersion,
+                        )
+                        resultIdentity?.diagnostic?.takeIf(String::isNotBlank)?.let(::appendLog)
+                        resultIdentity?.historyError?.takeIf(String::isNotBlank)?.let { appendLog("설치 이력 확인: $it") }
+                        resultInspection?.let(::logInspection)
+                        error?.let { appendLog("상태 확인: $it") }
+                        resultLatest?.takeIf { it.uploadedAt == null }?.let { checkPatchUploadedAt(it, target, install, ticket) }
+                    }
+                } else if (!stopped && state.busy && refreshGate.isCurrent(ticket)) {
+                    // An older background result must not invalidate the fresh operation's ticket.
+                    // Refresh after the operation or after its confirmation is dismissed instead.
+                    refreshAfterWork = true
                 }
-            } finally {
                 inspecting = false
-                main.post {
-                    if (state.selectedTarget != target && !state.busy) refresh()
-                    maybeFinishManualRefresh()
-                }
+                refreshGate.finish(ticket)
+                drainRefresh()
+                maybeFinishManualRefresh()
             }
         }
     }
 
-    private fun checkLatestPatchVersion(target: GameTarget, gameVersion: String?) {
+    private fun checkPatchUploadedAt(release: ReleaseEntry, target: GameTarget, install: GameInstall?, ticket: Long) {
         updateExecutor.execute {
-            try {
-                val index = PatchHttpClient.getIndex()
-                val latest = if (gameVersion != null) {
-                    PatchProtocol.latestReleaseForRoute(index, target.route, gameVersion)
-                } else {
-                    PatchProtocol.latestReleaseForRoute(index, target.route)
-                }
-                main.post {
-                    if (state.selectedTarget == target) {
-                        state = state.copy(
-                            latestPatchVersion = latest?.patchVersion,
-                            latestPatchUploadedAt = latest?.uploadedAt,
-                            latestPatchStatus = if (latest == null) "호환되는 정식 패치 없음" else "확인 완료",
-                        )
-                        maybeFinishManualRefresh()
-                    }
-                }
-            } catch (error: Exception) {
-                main.post {
-                    if (state.selectedTarget == target) {
-                        state = state.copy(
-                            latestPatchVersion = null,
-                            latestPatchUploadedAt = null,
-                            latestPatchStatus = "확인 실패",
-                        )
-                        maybeFinishManualRefresh()
-                    }
-                    appendLog("최신 한글패치 버전 확인에 실패했습니다. ${error.message ?: error.javaClass.simpleName}")
-                }
+            val result = runCatching { PatchHttpClient.getPatchUploadedAt(release) }
+            main.post {
+                if (stopped || !refreshGate.isCurrent(ticket) || state.selectedTarget != target ||
+                    state.latestPatchVersion != release.patchVersion || !sameInstallationSnapshot(install, state.selectedInstall)) return@post
+                state = state.copy(
+                    latestPatchUploadedAt = result.getOrNull(),
+                    latestPatchUploadStatus = if (result.isFailure) "조회 실패" else if (result.getOrNull() == null) "업로드 정보 없음" else "확인 완료",
+                )
+                result.exceptionOrNull()?.let { appendLog("한글패치 업로드 시각 확인 실패: ${it.message}") }
+                maybeFinishManualRefresh()
             }
         }
     }
 
     private fun checkPatcherUpdate() {
-        if (updateChecking) return
+        if (updateChecking) {
+            updatePending = true
+            return
+        }
         updateChecking = true
+        state = state.copy(patcherUpdateStatus = "확인 중")
         updateExecutor.execute {
-            try {
-                val latest = PatchHttpClient.getLatestMobilePatcherRelease()
-                val available = latest.takeIf { it.isNewerThan(BuildConfig.VERSION_CODE) }
-                latestPatcher = available
-                main.post {
-                    state = state.copy(availablePatcherVersion = available?.version)
+            val result = runCatching { PatchHttpClient.getLatestMobilePatcherRelease() }
+            main.post {
+                if (stopped) return@post
+                result.onSuccess { latest ->
+                    val available = latest.takeIf { it.isNewerThan(BuildConfig.VERSION_CODE) }
+                    latestPatcher = available
+                    state = state.copy(availablePatcherVersion = available?.version,
+                        patcherUpdateStatus = if (available != null) "업데이트 있음" else "최신 버전",
+                        patcherUpdateCheckedAt = System.currentTimeMillis())
+                }.onFailure { error ->
+                    state = state.copy(patcherUpdateStatus = "확인 실패")
+                    appendLog("Android 패처 업데이트 확인 실패: ${error.message}")
                 }
-            } catch (error: Exception) {
-                latestPatcher = null
-                main.post {
-                    state = state.copy(availablePatcherVersion = null)
-                    appendLog(
-                        "Android 패처 업데이트 확인에 실패했습니다. " +
-                            (error.message ?: error.javaClass.simpleName)
-                    )
-                }
-            } finally {
                 updateChecking = false
-                main.post { maybeFinishManualRefresh() }
+                if (updatePending) {
+                    updatePending = false
+                    checkPatcherUpdate()
+                }
+                maybeFinishManualRefresh()
             }
         }
     }
-
-    private fun isResourceNotReady(error: Throwable): Boolean =
-        generateSequence(error) { it.cause }
-            .mapNotNull(Throwable::message)
-            .any { message ->
-                RESOURCE_NOT_READY_MESSAGES.any(message::contains)
-            }
 
     private fun installedGames(): Map<GameTarget, GameInstall> = buildMap {
         GameTarget.entries.forEach { target ->
@@ -1047,12 +1077,31 @@ private class PatchController(private val activity: MainActivity) {
         }
     }
 
-    private fun installedGame(target: GameTarget): GameInstall? = runCatching {
-        val version = activity.packageManager.getPackageInfo(target.packageName, 0).versionName
-            ?: "알 수 없음"
-        val installer = activity.packageManager.getInstallSourceInfo(target.packageName).installingPackageName
-        GameInstall(version, installer == PLAY_STORE_PACKAGE)
-    }.getOrNull()
+    private fun installedGame(target: GameTarget, strict: Boolean = false): GameInstall? {
+        val info = try {
+            activity.packageManager.getPackageInfo(target.packageName, 0)
+        } catch (_: PackageManager.NameNotFoundException) {
+            return null
+        } catch (error: Exception) {
+            if (strict) throw error
+            appendLog("${target.displayName} 설치 정보를 조회하지 못했습니다: ${error.message}")
+            return state.gameInstalls[target]
+        }
+        val source = runCatching {
+            activity.packageManager.getInstallSourceInfo(target.packageName).installingPackageName
+        }
+        return GameInstall(
+            version = info.versionName,
+            installedFromPlay = source.getOrNull() == PLAY_STORE_PACKAGE,
+            versionCode = info.longVersionCode,
+            lastUpdateTime = info.lastUpdateTime,
+            sourceDir = info.applicationInfo?.sourceDir.orEmpty(),
+            splitSourceDirs = info.applicationInfo?.splitSourceDirs?.toList().orEmpty(),
+            userId = android.os.Process.myUid() / 100_000,
+            installerKnown = source.isSuccess && source.getOrNull() != null,
+            packageName = target.packageName,
+        )
+    }
 
     @Suppress("DEPRECATION")
     private fun verifyOriginalGameApks(apks: List<File>, release: OriginalGameRelease) {
@@ -1184,32 +1233,50 @@ private class PatchController(private val activity: MainActivity) {
     }
 
     private fun setBusy(label: String, progress: Float, section: ProgressSection) {
+        if (section == ProgressSection.PATCH && patchStatusBeforeWork == null) {
+            patchStatusBeforeWork = PatchInstallationStatus(state.releaseLabel, state.releaseStatus, state.releaseIndicator)
+        }
         state = state.copy(
             busy = true,
             progressSection = section,
             progressLabel = label,
             progress = progress,
+            releaseLabel = if (section == ProgressSection.PATCH) "한글패치 작업 중" else state.releaseLabel,
+            releaseStatus = if (section == ProgressSection.PATCH) label else state.releaseStatus,
+            releaseIndicator = if (section == ProgressSection.PATCH) StatusIndicator.IN_PROGRESS else state.releaseIndicator,
         )
         appendLog(label)
     }
 
     private fun updateBusy(label: String, progress: Float) {
         main.post {
+            if (stopped) return@post
             val nextProgress = progress.coerceIn(0f, 1f)
             state = state.copy(
                 progressLabel = label,
                 progress = maxOf(state.progress, nextProgress),
+                releaseStatus = if (state.progressSection == ProgressSection.PATCH) label else state.releaseStatus,
             )
         }
     }
 
     private fun setIdle() {
+        val previousPatchStatus = patchStatusBeforeWork
+        patchStatusBeforeWork = null
         state = state.copy(
             busy = false,
             progressSection = null,
             progressLabel = null,
             progress = 0f,
+            releaseLabel = previousPatchStatus?.label ?: state.releaseLabel,
+            releaseStatus = previousPatchStatus?.description ?: state.releaseStatus,
+            releaseIndicator = previousPatchStatus?.indicator ?: state.releaseIndicator,
         )
+        if (refreshAfterWork && pendingOperation == null) {
+            refreshAfterWork = false
+            refreshGate.request()
+        }
+        main.post { drainRefresh() }
     }
 
     private fun appendServiceDiagnostics(
@@ -1270,16 +1337,28 @@ private class PatchController(private val activity: MainActivity) {
 
     private fun showError(prefix: String, error: Throwable) {
         main.post {
+            if (stopped) return@post
+            val patchWorkFailed = state.progressSection == ProgressSection.PATCH
             appendLog("$prefix ${error.message ?: error.javaClass.simpleName}")
+            state = state.copy(actionMessage = "$prefix ${error.message ?: error.javaClass.simpleName}")
             setIdle()
+            if (patchWorkFailed) {
+                state = state.copy(
+                    releaseLabel = "한글패치 작업 실패",
+                    releaseStatus = "아래 안내와 실행 로그를 확인한 뒤 다시 시도해 주세요",
+                    releaseIndicator = StatusIndicator.ERROR,
+                )
+            }
         }
     }
 
     private fun appendLog(message: String) {
         if (message.isBlank()) return
         val action = {
-            val timestamp = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
-            state = state.copy(logs = (state.logs + "[$timestamp] ${message.trim()}").takeLast(300))
+            if (!stopped) {
+                val timestamp = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
+                state = state.copy(logs = (state.logs + "[$timestamp] ${message.trim()}").takeLast(300))
+            }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) action() else main.post(action)
     }
@@ -1289,16 +1368,48 @@ private class PatchController(private val activity: MainActivity) {
         private const val SHIZUKU_PERMISSION_REQUEST = 1001
         private const val PREFERENCES_NAME = "patcher-preferences"
         private const val PREFERENCE_GAME_TARGET = "game-target"
-        private val RESOURCE_NOT_READY_MESSAGES = listOf(
-            "외부 files 디렉터리를 찾지 못했습니다",
-            "게임을 먼저 실행해 리소스를 다운로드",
-            "Addressables bundle cache를 찾지 못했습니다",
-            "게임 catalog hash를 찾지 못했습니다",
-        )
     }
 }
 
-internal data class GameInstall(val version: String, val installedFromPlay: Boolean)
+internal data class GameInstall(
+    val version: String?,
+    val installedFromPlay: Boolean,
+    val versionCode: Long = 0,
+    val lastUpdateTime: Long = 0,
+    val sourceDir: String = "",
+    val splitSourceDirs: List<String> = emptyList(),
+    val userId: Int = 0,
+    val installerKnown: Boolean = true,
+    val packageName: String = "",
+) {
+    fun sameInstallation(other: GameInstall?): Boolean = other != null &&
+        version == other.version && versionCode == other.versionCode &&
+        lastUpdateTime == other.lastUpdateTime && sourceDir == other.sourceDir &&
+        splitSourceDirs == other.splitSourceDirs && userId == other.userId && packageName == other.packageName
+
+    fun toJson(): String = JSONObject()
+        .put("packageName", packageName)
+        .put("versionName", version ?: JSONObject.NULL)
+        .put("versionCode", versionCode)
+        .put("lastUpdateTime", lastUpdateTime)
+        .put("sourceDir", sourceDir)
+        .put("splitSourceDirs", JSONArray(splitSourceDirs))
+        .put("userId", userId)
+        .toString()
+}
+
+internal fun sameInstallationSnapshot(left: GameInstall?, right: GameInstall?): Boolean =
+    if (left == null) right == null else left.sameInstallation(right)
+
+private data class PreparedOperation(
+    val target: GameTarget,
+    val install: GameInstall,
+    val release: ReleaseEntry,
+    val manifest: PatchManifest,
+    val inspection: PatchTargetInspection,
+    val operation: String,
+    val ticket: Long,
+)
 private data class PendingInstall(val apk: File, val target: InstallTarget)
 
 private enum class InstallTarget {
@@ -1318,6 +1429,8 @@ private fun PatchManagerScreen(
     onPatch: () -> Unit,
     onRestore: () -> Unit,
     onLaunch: () -> Unit,
+    onConfirmOperation: () -> Unit = {},
+    onDismissOperation: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var logsExpanded by rememberSaveable { mutableStateOf(false) }
@@ -1341,7 +1454,22 @@ private fun PatchManagerScreen(
         PatcherDimensions.dialogMaxWidth,
     )
 
-    if (updateVersion != null && deferredUpdateVersion != updateVersion) {
+    if (state.confirmation != null) {
+        val confirmation = state.confirmation
+        AlertDialog(
+            onDismissRequest = onDismissOperation,
+            title = { Text("리소스 버전이 다릅니다") },
+            text = {
+                Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                    Text("설치된 리소스: ${confirmation.installedResource}\n최신 한글패치 리소스: ${confirmation.release}\n\n${confirmation.reason}\n\n계속하면 최신 한글패치 리소스의 ${if (confirmation.operation == "RESTORE") "원본" else "패치"}으로 교체합니다.")
+                }
+            },
+            confirmButton = { Button(onClick = onConfirmOperation) {
+                Text(if (confirmation.operation == "RESTORE") "계속 원본 복구" else "계속 설치")
+            } },
+            dismissButton = { TextButton(onClick = onDismissOperation) { Text("취소") } },
+        )
+    } else if (!state.busy && updateVersion != null && deferredUpdateVersion != updateVersion) {
         val displayVersion = if (updateVersion.startsWith("v")) updateVersion else "v$updateVersion"
         AlertDialog(
             onDismissRequest = { deferredUpdateVersion = updateVersion },
@@ -1643,119 +1771,98 @@ private fun EnvironmentStatusSection(
             title = null,
             topCorner = PatcherShapes.card,
             bottomCorner = PatcherShapes.attached,
-            progressState = state.takeIf {
-                it.busy && it.progressSection == ProgressSection.SHIZUKU
-            },
+            progressState = state.takeIf { it.busy && it.progressSection == ProgressSection.SHIZUKU },
         ) {
-            ListItem(
-                colors = transparentListItemColors(),
-                leadingContent = {
-                    StatusIndicatorDot(
-                        if (state.shizukuStatus == "확인 중") StatusIndicator.IN_PROGRESS
-                        else if (state.shizukuReady) StatusIndicator.COMPLETED
-                        else StatusIndicator.PENDING,
-                    )
-                },
-                trailingContent = if (state.shizukuReady) {
-                    null
-                } else {
-                    {
-                        FilledTonalButton(
-                            onClick = onShizuku,
-                            enabled = !state.busy,
-                        ) {
-                            Text(state.shizukuActionLabel)
-                        }
-                    }
-                },
-                supportingContent = { Text(state.shizukuStatus) },
-                content = { Text(state.shizukuLabel) },
+            StatusSummary(
+                title = state.shizukuLabel,
+                description = state.shizukuStatus,
+                indicator = if (state.shizukuStatus == "확인 중") StatusIndicator.IN_PROGRESS
+                    else if (state.shizukuReady) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
+                actionLabel = state.shizukuActionLabel.takeUnless { state.shizukuReady },
+                actionEnabled = !state.busy,
+                onAction = onShizuku,
             )
         }
-
         SectionCard(
             title = null,
             topCorner = PatcherShapes.attached,
             bottomCorner = PatcherShapes.attached,
-            progressState = state.takeIf {
-                it.busy && it.progressSection == ProgressSection.APK
-            },
+            progressState = state.takeIf { it.busy && it.progressSection == ProgressSection.APK },
         ) {
-            val install = state.selectedInstall
-            val ready = state.gameReady
-            if (state.selectedTarget.supportsOriginalInstall) {
-                ListItem(
-                    colors = transparentListItemColors(),
-                    leadingContent = {
-                        StatusIndicatorDot(
-                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
-                        )
-                    },
-                    trailingContent = if (ready) null else {
-                        {
-                            FilledTonalButton(
-                                onClick = onGame,
-                                enabled = state.shizukuReady && !state.busy,
-                            ) {
-                                Text("설치")
-                            }
-                        }
-                    },
-                    supportingContent = {
-                        Text(
-                            gameApkStatusDescription(
-                                state.selectedTarget,
-                                install,
-                                state.shizukuReady,
-                            )
-                        )
-                    },
-                    content = { Text(gameApkStatusLabel(state.selectedTarget, install)) },
-                )
-            } else {
-                ListItem(
-                    colors = transparentListItemColors(),
-                    leadingContent = {
-                        StatusIndicatorDot(
-                            if (ready) StatusIndicator.COMPLETED else StatusIndicator.PENDING
-                        )
-                    },
-                    supportingContent = {
-                        Text(gameApkStatusDescription(state.selectedTarget, install))
-                    },
-                    content = { Text(gameApkStatusLabel(state.selectedTarget, install)) },
-                )
-            }
+            StatusSummary(
+                title = gameApkStatusLabel(state.selectedTarget, state.selectedInstall),
+                description = gameApkStatusDescription(state.selectedTarget, state.selectedInstall, state.shizukuReady),
+                indicator = if (state.gameReady) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
+                actionLabel = "설치".takeIf { state.selectedTarget.supportsOriginalInstall && !state.gameReady },
+                actionEnabled = state.shizukuReady && !state.busy,
+                onAction = onGame,
+            )
         }
-
         SectionCard(
             title = null,
             topCorner = PatcherShapes.attached,
             bottomCorner = PatcherShapes.card,
         ) {
-            ListItem(
-                colors = transparentListItemColors(),
-                leadingContent = { StatusIndicatorDot(state.resourceIndicator) },
-                trailingContent = if (
-                    state.resourceIndicator == StatusIndicator.PENDING &&
-                    state.resourceNeedsDownload &&
-                    state.canLaunch
-                ) {
-                    {
-                        FilledTonalButton(
-                            onClick = onLaunch,
-                            enabled = !state.busy,
-                        ) {
-                            Text("게임 실행")
-                        }
-                    }
-                } else {
-                    null
-                },
-                supportingContent = { Text(state.resourceStatus) },
-                content = { Text(state.resourceLabel) },
+            StatusSummary(
+                title = state.resourceLabel,
+                description = state.resourceStatus,
+                indicator = state.resourceIndicator,
+                actionLabel = "게임 실행".takeIf { state.resourceNeedsDownload && state.canLaunch },
+                actionEnabled = !state.busy,
+                onAction = onLaunch,
             )
         }
+    }
+}
+
+/** Keep the indicator with the heading; long explanations and actions each get their own width. */
+@Composable
+private fun StatusSummary(
+    title: String,
+    description: String,
+    indicator: StatusIndicator,
+    actionLabel: String? = null,
+    actionEnabled: Boolean = true,
+    onAction: () -> Unit = {},
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = PatcherSpacing.card, vertical = PatcherSpacing.screen),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(PatcherSpacing.small),
+        ) {
+            StatusIndicatorDot(indicator)
+            Text(title, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+        }
+        Text(
+            description,
+            modifier = Modifier.fillMaxWidth().padding(start = PatcherSpacing.statusTextInset, top = 4.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        actionLabel?.let { label ->
+            FilledTonalButton(
+                onClick = onAction,
+                enabled = actionEnabled,
+                modifier = Modifier.align(Alignment.End).padding(top = PatcherSpacing.small).widthIn(min = 96.dp),
+            ) {
+                Text(label, maxLines = 1, softWrap = false)
+            }
+        }
+    }
+}
+
+/** Values may wrap without squeezing the label or inheriting ListItem's trailing-slot constraints. */
+@Composable
+private fun PatchVersionDetail(label: String, value: String) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = PatcherSpacing.card, vertical = PatcherSpacing.small),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.bodyLarge)
     }
 }
 
@@ -1771,55 +1878,18 @@ private fun PatchStatusSection(
             it.busy && it.progressSection == ProgressSection.PATCH
         },
     ) {
-        ListItem(
-            colors = transparentListItemColors(),
-            leadingContent = { StatusIndicatorDot(state.releaseIndicator) },
-            supportingContent = { Text(state.releaseStatus) },
-            content = { Text(state.releaseLabel) },
+        StatusSummary(
+            title = state.releaseLabel,
+            description = state.releaseStatus,
+            indicator = state.releaseIndicator,
         )
         SectionDivider(color = MaterialTheme.colorScheme.surfaceContainerLow)
-        ListItem(
-            colors = transparentListItemColors(),
-            contentPadding = PaddingValues(
-                start = PatcherSpacing.latestVersion,
-                end = PatcherSpacing.latestVersion,
-                top = PatcherSpacing.small,
-                bottom = 2.dp,
-            ),
-            trailingContent = {
-                Text(
-                    state.latestPatchVersion ?: state.latestPatchStatus,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
-            content = {
-                Text(
-                    "최신 버전",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
-        )
-        ListItem(
-            colors = transparentListItemColors(),
-            contentPadding = PaddingValues(
-                start = PatcherSpacing.latestVersion,
-                end = PatcherSpacing.latestVersion,
-                top = 2.dp,
-                bottom = PatcherSpacing.small,
-            ),
-            trailingContent = {
-                Text(
-                    formatPatchUploadedAt(state.latestPatchUploadedAt),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
-            content = {
-                Text(
-                    "업로드 시각",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            },
-        )
+        state.actionMessage?.let { message ->
+            Text(message, modifier = Modifier.padding(PatcherSpacing.card), color = MaterialTheme.colorScheme.error)
+        }
+        PatchVersionDetail("설치된 리소스", state.compatiblePatchVersion ?: "확인 불가")
+        PatchVersionDetail("최신 한글패치 리소스", state.latestPatchVersion ?: state.latestPatchStatus)
+        PatchVersionDetail("업로드 시각", state.latestPatchUploadedAt?.let(::formatPatchUploadedAt) ?: state.latestPatchUploadStatus)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1860,7 +1930,9 @@ private fun PatchStatusSection(
                 ),
             ) {
                 Text(
-                    if (
+                    if (state.installedPatchVersion != null && state.installedPatchVersion == state.patchVersion) {
+                        "한글패치 재설치"
+                    } else if (
                         state.installedPatchVersion != null &&
                         state.patchVersion != null &&
                         state.installedPatchVersion != state.patchVersion
@@ -2079,6 +2151,7 @@ private fun SectionCard(
 private fun StatusIndicatorDot(indicator: StatusIndicator) {
     val dark = isSystemInDarkTheme()
     val color = when (indicator) {
+        StatusIndicator.NEUTRAL -> MaterialTheme.colorScheme.onSurfaceVariant
         StatusIndicator.ERROR -> if (dark) Color(0xFFFFB4AB) else Color(0xFFBA1A1A)
         StatusIndicator.PENDING -> if (dark) Color(0xFFFFD54F) else Color(0xFFF9A825)
         StatusIndicator.IN_PROGRESS -> if (dark) Color(0xFF8AB4F8) else Color(0xFF1967D2)
@@ -2137,7 +2210,7 @@ private object PatcherSpacing {
     val screen = 16.dp
     val section = 16.dp
     val card = 20.dp
-    val latestVersion = 28.dp
+    val statusTextInset = 36.dp
 }
 
 private object PatcherShapes {
@@ -2165,12 +2238,11 @@ private fun gameTargetDescription(target: GameTarget, install: GameInstall?): St
     install == null && target.supportsOriginalInstall ->
         "${target.packageName} • 미설치 • 설치 가능"
     install == null -> "${target.packageName} • 미설치"
-    else -> "${target.packageName} • 설치됨 • v${install.version}"
+    else -> "${target.packageName} • 설치됨 • ${install.version ?: "버전 알 수 없음"}"
 }
 
 private fun gameApkStatusLabel(target: GameTarget, install: GameInstall?): String = when {
     install == null -> "${target.displayName} 게임 미설치"
-    target.supportsOriginalInstall && !install.installedFromPlay -> "${target.displayName} 설치 오류"
     else -> "${target.displayName} 설치됨"
 }
 
@@ -2185,8 +2257,11 @@ private fun gameApkStatusDescription(
         "설치 가능 • Shizuku 활성화 및 권한이 필요합니다"
     }
     install == null -> "스토어에서 吉星派对를 설치해 주세요"
-    target.supportsOriginalInstall && !install.installedFromPlay -> "게임을 삭제 후 재설치해 주세요"
-    else -> "v${install.version}"
+    else -> (install.version ?: "버전 알 수 없음") + when {
+        !install.installerKnown -> " · 설치 출처 확인 불가"
+        target.supportsOriginalInstall && !install.installedFromPlay -> " · Play 외 설치 출처"
+        else -> ""
+    }
 }
 
 private fun activityClipboardManager(context: android.content.Context): android.content.ClipboardManager =
@@ -2207,6 +2282,62 @@ private fun AstralMaterialTheme(content: @Composable () -> Unit) {
         motionScheme = androidx.compose.material3.MotionScheme.expressive(),
         content = content,
     )
+}
+
+@Preview(name = "긴 리소스 안내 · 좁은 화면", showBackground = true, widthDp = 320, heightDp = 360)
+@Preview(name = "긴 리소스 안내 · 큰 글꼴", showBackground = true, widthDp = 560, heightDp = 360, fontScale = 1.5f)
+@Composable
+private fun LongResourceStatusPreview() {
+    AstralMaterialTheme {
+        SectionCard(title = null) {
+            StatusSummary(
+                title = "리소스 다운로드 필요",
+                description = "대상 1개가 없습니다. 게임에서 리소스를 다운로드한 후 다시 시도해 주세요.\n게임을 최신 상태로 업데이트하고 추가 다운로드가 끝났는지 확인해 주세요.",
+                indicator = StatusIndicator.PENDING,
+                actionLabel = "게임 실행",
+            )
+        }
+    }
+}
+
+@Preview(name = "한글패치 버전 안내", showBackground = true, widthDp = 360, heightDp = 600)
+@Composable
+private fun PatchVersionDetailsPreview() {
+    AstralMaterialTheme {
+        PatchStatusSection(
+            state = PatchUiState(
+                releaseLabel = "한글패치 미설치",
+                releaseStatus = "설치 버튼을 누르면 최신 한글패치 리소스를 적용합니다",
+                releaseIndicator = StatusIndicator.NEUTRAL,
+                latestPatchVersion = "v3.3.0_r026_p0",
+                compatiblePatchVersion = "v3.3.0_r021_p0",
+                latestPatchUploadedAt = "2026-10-19T12:25:00Z",
+            ),
+            onRestore = {},
+            onPatch = {},
+        )
+    }
+}
+
+@Preview(name = "한글패치 설치 완료", showBackground = true, widthDp = 360, heightDp = 520)
+@Composable
+private fun InstalledPatchStatusPreview() {
+    AstralMaterialTheme {
+        PatchStatusSection(
+            state = PatchUiState(
+                releaseLabel = "최신 한글패치 설치 완료",
+                releaseStatus = "v3.3.0_r026_p0",
+                releaseIndicator = StatusIndicator.COMPLETED,
+                installedPatchVersion = "v3.3.0_r026_p0",
+                patchVersion = "v3.3.0_r026_p0",
+                latestPatchVersion = "v3.3.0_r026_p0",
+                compatiblePatchVersion = "v3.3.0_r026_p0",
+                latestPatchUploadedAt = "2026-10-19T09:02:00Z",
+            ),
+            onRestore = {},
+            onPatch = {},
+        )
+    }
 }
 
 @Preview(
@@ -2232,8 +2363,9 @@ private fun PatchManagerScreenPreview() {
         shizukuActionLabel = "열기",
         resourceStatus = "게임 리소스 확인 완료",
         resourceIndicator = StatusIndicator.COMPLETED,
+        releaseLabel = "한글패치 미설치",
         releaseStatus = "한글패치 적용 가능",
-        releaseIndicator = StatusIndicator.PENDING,
+        releaseIndicator = StatusIndicator.NEUTRAL,
         latestPatchVersion = "1.4.0",
         patchVersion = "1.4.0",
         logs = listOf(

@@ -75,6 +75,18 @@ class PatchProtocolTest {
     }
 
     @Test(expected = IllegalArgumentException::class)
+    fun rejectsManifestThatDoesNotMatchTheSelectedReleaseDigest() {
+        val selectedBytes = manifestJson().toByteArray()
+        val selected = ReleaseEntry(
+            "INT_ANDROID", "3.2.0", "116", "b".repeat(32), "v3.2.0_r116",
+            trustedUrl("INT_ANDROID_manifest.json"), sha256(selectedBytes),
+        )
+        // Even an otherwise valid manifest for the same release cannot replace the pinned bytes.
+        val changedBytes = manifestJson().replace("build-1", "build-2").toByteArray()
+        PatchProtocol.parseManifest(changedBytes, selected, "INT_ANDROID")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
     fun rejectsGameDataTargets() {
         val manifest = manifestJson().replace("\"addressables\"", "\"game-data\"").toByteArray()
         PatchProtocol.parseManifest(
