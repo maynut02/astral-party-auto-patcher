@@ -91,6 +91,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
@@ -204,10 +206,12 @@ internal data class PatchUiState(
         get() = selectedInstall != null
     val gameReady: Boolean
         get() = selectedInstalled
+    // This immutable state snapshot shares one version comparison across all UI consumers.
+    val gameUpdateRequirement: GameUpdateRequirement? = requiredGameUpdate(selectedInstall?.version, latestRelease)
     val canPatch: Boolean
-        get() = !busy
+        get() = !busy && gameUpdateRequirement == null
     val canRestore: Boolean
-        get() = !busy
+        get() = canPatch
     val canLaunch: Boolean
         get() = selectedInstalled && !busy
 }
@@ -703,6 +707,21 @@ private class PatchController(private val activity: MainActivity) {
                 val release = requireNotNull(PatchProtocol.latestReleaseForRoute(index, target.route)) {
                     "이 게임의 최신 한글패치 리소스가 없습니다."
                 }
+                val update = requiredGameUpdate(install.version, release)
+                if (update != null) {
+                    main.post {
+                        if (stopped) return@post
+                        setIdle()
+                        if (refreshGate.isCurrent(ticket) && state.selectedTarget == target &&
+                            install.sameInstallation(installedGame(target))) {
+                            state = state.copy(latestRelease = release, latestPatchVersion = release.patchVersion,
+                                patchVersion = release.patchVersion, actionMessage = null)
+                            appendLog("게임 업데이트 필요: ${update.description}. ${gameUpdateGuidance(target)}")
+                        }
+                        refresh()
+                    }
+                    return@execute
+                }
                 val identity = PatchProtocol.parseInspection(patchService.inspectGame(target.packageName))
                 val selectedManifest = PatchProtocol.parseManifest(PatchHttpClient.getManifest(release, ::appendLog), release, target.route)
                 val inspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
@@ -879,10 +898,8 @@ private class PatchController(private val activity: MainActivity) {
             var releases = emptyList<ReleaseEntry>()
             var latest: ReleaseEntry? = null
             var compatible: ReleaseEntry? = null
-            var resolvedManifest: PatchManifest? = null
-            var targetInspection: PatchTargetInspection? = null
-            var installedManifest: PatchManifest? = null
-            var installedInspection: PatchTargetInspection? = null
+            var targetObservation: PatchStatusObservation? = null
+            var installedObservation: PatchStatusObservation? = null
             if (patchService != null && install?.userId == 0) {
                 runCatching {
                     requireService(patchService)
@@ -899,51 +916,45 @@ private class PatchController(private val activity: MainActivity) {
                     // Catalog matching describes installed resources; it never selects the download target.
                     compatible = runCatching { PatchProtocol.resolveRelease(index, observed, target.route) }.getOrNull()
                 }
-                val choice = latest
-                if (choice != null && patchService != null && install?.userId == 0) {
-                    resolvedManifest = PatchProtocol.parseManifest(PatchHttpClient.getManifest(choice, ::appendLog), choice, target.route)
-                    targetInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(target.packageName,
-                        PatchProtocol.createTargetInspectionRequest(requireNotNull(resolvedManifest), choice, "PATCH", install.toJson())))
-                    installedManifest = resolvedManifest
-                    installedInspection = targetInspection
-                    // Compare older translation manifests only when the latest files cannot prove the state.
-                    val primary = PatchStatusObservation(requireNotNull(resolvedManifest), requireNotNull(targetInspection))
-                    val compatibleObservation = compatible?.takeIf { it != choice }?.let { installedRelease ->
-                        runCatching {
-                            val previousManifest = PatchProtocol.parseManifest(
-                                PatchHttpClient.getManifest(installedRelease, ::appendLog), installedRelease, target.route,
-                            )
-                            val previousInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
-                                target.packageName, PatchProtocol.createTargetInspectionRequest(
-                                    previousManifest, installedRelease, "PATCH", install.toJson(),
-                                ),
-                            ))
-                            PatchStatusObservation(previousManifest, previousInspection)
-                        }.onFailure { appendLog("설치된 한글패치 상태 확인: ${describeError(it)}") }.getOrNull()
+                val latestRelease = latest
+                if (latestRelease != null && patchService != null && install?.userId == 0) {
+                    val update = requiredGameUpdate(install.version, latestRelease)
+                    // This choice is for read-only installed-state evidence; action targets stay latest.
+                    val choice = if (update != null) compatible else latestRelease
+                    if (choice != null) {
+                        // Results live only for this refresh, including failures. A fallback must not
+                        // repeat the same manifest transfer and file scan after an earlier attempt.
+                        val inspected = mutableMapOf<ReleaseEntry, Result<PatchStatusObservation>>()
+                        fun inspectRelease(release: ReleaseEntry): PatchStatusObservation = inspected.getOrPut(release) {
+                            runCatching {
+                                val verifiedManifest = PatchProtocol.parseManifest(
+                                    PatchHttpClient.getManifest(release, ::appendLog), release, target.route,
+                                )
+                                val inspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
+                                    target.packageName, PatchProtocol.createTargetInspectionRequest(
+                                        verifiedManifest, release, "PATCH", install.toJson(),
+                                    ),
+                                ))
+                                PatchStatusObservation(verifiedManifest, inspection)
+                            }
+                        }.getOrThrow()
+                        val primary = inspectRelease(choice)
+                        targetObservation = primary
+                        val compatibleObservation = compatible?.takeIf { it != choice }?.let { installedRelease ->
+                            runCatching { inspectRelease(installedRelease) }
+                                .onFailure { appendLog("설치된 한글패치 상태 확인: ${describeError(it)}") }.getOrNull()
+                        }
+                        installedObservation = selectPatchStatusObservation(
+                            primary, compatibleObservation, observed, releases,
+                            load = ::inspectRelease,
+                            onFailure = { release, error -> appendLog("구버전 설치 확인 (${release.patchVersion}): ${describeError(error)}") },
+                        )
                     }
-                    val statusObservation = selectPatchStatusObservation(
-                        primary, compatibleObservation, observed, releases,
-                        load = { previousRelease ->
-                            val previousManifest = PatchProtocol.parseManifest(
-                                PatchHttpClient.getManifest(previousRelease, ::appendLog), previousRelease, target.route,
-                            )
-                            val previousInspection = PatchProtocol.parseTargetInspection(patchService.inspectPatchTargets(
-                                target.packageName, PatchProtocol.createTargetInspectionRequest(
-                                    previousManifest, previousRelease, "PATCH", install.toJson(),
-                                ),
-                            ))
-                            PatchStatusObservation(previousManifest, previousInspection)
-                        },
-                        onFailure = { release, error -> appendLog("구버전 설치 확인 (${release.patchVersion}): ${describeError(error)}") },
-                    )
-                    installedManifest = statusObservation.manifest
-                    installedInspection = statusObservation.inspection
                 }
             }.onFailure { releaseError = it.message ?: it.javaClass.simpleName }
             val resultIdentity = identity
-            val resultInspection = targetInspection
-            val resultManifest = installedManifest ?: resolvedManifest
-            val resultInstalledInspection = installedInspection ?: targetInspection
+            val resultInspection = targetObservation?.inspection
+            val resultObservation = installedObservation ?: targetObservation
             val resultReleases = releases
             val resultLatest = latest
             val resultCompatible = compatible
@@ -954,6 +965,7 @@ private class PatchController(private val activity: MainActivity) {
                         refresh()
                     } else {
                         val ready = resultInspection?.isReady == true
+                        val gameUpdate = requiredGameUpdate(install?.version, resultLatest)
                         val unavailableReason = when {
                             install == null -> "게임을 설치한 뒤 한글패치를 적용해 주세요"
                             install.userId != 0 -> "기본 사용자 프로필에서 실행해 주세요"
@@ -961,11 +973,12 @@ private class PatchController(private val activity: MainActivity) {
                             else -> null
                         }
                         val patchStatus = resolvePatchInstallationStatus(
-                            resultIdentity, resultInstalledInspection, resultManifest, install?.version,
+                            resultIdentity, resultObservation?.inspection, resultObservation?.manifest, install?.version,
                             resultLatest, resultReleases, unavailableReason, error,
                         )
                         state = state.copy(
                             resourceLabel = when {
+                                gameUpdate != null -> "리소스 확인 대기"
                                 ready -> "리소스 확인 완료"
                                 resultInspection?.missing?.let { it > 0 } == true -> "리소스 다운로드 필요"
                                 resultInspection?.incompatible?.let { it > 0 } == true -> "리소스 호환성 확인 필요"
@@ -973,6 +986,7 @@ private class PatchController(private val activity: MainActivity) {
                                 else -> "리소스 확인 불가"
                             },
                             resourceStatus = when {
+                                gameUpdate != null -> "게임을 ${gameUpdate.requiredVersion}으로 업데이트한 뒤 리소스를 확인합니다."
                                 ready -> "대상 파일 ${resultInspection.total}개를 확인했습니다"
                                 resultInspection?.canWrite == true -> "기존 파일을 확인했습니다. 최신 한글패치로 교체할 수 있습니다."
                                 resultInspection != null -> inspectionFailure(resultInspection)
@@ -982,13 +996,14 @@ private class PatchController(private val activity: MainActivity) {
                                 else -> "카탈로그를 확인하지 못했습니다. 설치 시 최신 리소스를 다시 확인합니다."
                             },
                             resourceIndicator = when {
+                                gameUpdate != null -> StatusIndicator.NEUTRAL
                                 ready -> StatusIndicator.COMPLETED
                                 resultInspection?.unreadable?.let { it > 0 } == true -> StatusIndicator.ERROR
                                 patchService == null || install == null -> StatusIndicator.NEUTRAL
                                 resultInspection == null && error != null -> StatusIndicator.ERROR
                                 else -> StatusIndicator.PENDING
                             },
-                            resourceNeedsDownload = resultInspection?.missing?.let { it > 0 } == true,
+                            resourceNeedsDownload = gameUpdate == null && resultInspection?.missing?.let { it > 0 } == true,
                             releaseLabel = patchStatus.label,
                             releaseStatus = patchStatus.description,
                             releaseIndicator = patchStatus.indicator,
@@ -1529,8 +1544,13 @@ private fun PatchManagerScreen(
             )
         },
         floatingActionButton = {
-            if (state.canLaunch) {
+            if (state.selectedInstalled) {
                 ExtendedFloatingActionButton(
+                    modifier = Modifier.semantics { if (!state.canLaunch) disabled() },
+                    containerColor = if (state.canLaunch) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                    contentColor = if (state.canLaunch) MaterialTheme.colorScheme.onPrimaryContainer
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
                     text = { Text("게임 실행") },
                     icon = {
                         Icon(
@@ -1538,7 +1558,7 @@ private fun PatchManagerScreen(
                             contentDescription = null,
                         )
                     },
-                    onClick = onLaunch,
+                    onClick = { if (state.canLaunch) onLaunch() },
                 )
             }
         },
@@ -1651,7 +1671,7 @@ private fun PatchManagerScreen(
 
                     Spacer(
                         Modifier.height(
-                            if (state.canLaunch) PatcherDimensions.fabClearance
+                            if (state.selectedInstalled) PatcherDimensions.fabClearance
                             else PatcherSpacing.small
                         )
                     )
@@ -1763,6 +1783,7 @@ private fun EnvironmentStatusSection(
     onGame: () -> Unit,
     onLaunch: () -> Unit,
 ) {
+    val gameUpdate = state.gameUpdateRequirement
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(PatcherSpacing.attached),
@@ -1790,9 +1811,13 @@ private fun EnvironmentStatusSection(
             progressState = state.takeIf { it.busy && it.progressSection == ProgressSection.APK },
         ) {
             StatusSummary(
-                title = gameApkStatusLabel(state.selectedTarget, state.selectedInstall),
-                description = gameApkStatusDescription(state.selectedTarget, state.selectedInstall, state.shizukuReady),
-                indicator = if (state.gameReady) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
+                title = if (gameUpdate != null) "${state.selectedTarget.displayName} 업데이트 필요"
+                    else gameApkStatusLabel(state.selectedTarget, state.selectedInstall),
+                description = gameUpdate?.let {
+                    "${it.description}\n${gameUpdateGuidance(state.selectedTarget)}"
+                } ?: gameApkStatusDescription(state.selectedTarget, state.selectedInstall, state.shizukuReady),
+                indicator = if (gameUpdate != null) StatusIndicator.PENDING
+                    else if (state.gameReady) StatusIndicator.COMPLETED else StatusIndicator.PENDING,
                 actionLabel = "설치".takeIf { state.selectedTarget.supportsOriginalInstall && !state.gameReady },
                 actionEnabled = state.shizukuReady && !state.busy,
                 onAction = onGame,

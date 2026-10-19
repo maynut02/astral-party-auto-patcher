@@ -26,10 +26,12 @@ internal fun resolvePatchInstallationStatus(
     if (!unavailableReason.isNullOrBlank()) {
         return PatchInstallationStatus("한글패치 확인 대기", unavailableReason, StatusIndicator.NEUTRAL)
     }
+    val update = requiredGameUpdate(installedGameVersion, latestRelease)
     if (inspection == null || manifest == null) {
         if (!error.isNullOrBlank()) {
             return PatchInstallationStatus("한글패치 확인 실패", error, StatusIndicator.ERROR)
         }
+        if (update != null) return awaitingGameUpdate(update)
         return unobservedPatchStatus(identity)
     }
     val files = inspection.files
@@ -50,6 +52,7 @@ internal fun resolvePatchInstallationStatus(
     }
     val missing = maxOf(inspection.missing, files.count { it.state == "MISSING" })
     if (missing > 0) {
+        if (update != null) return awaitingGameUpdate(update)
         return PatchInstallationStatus(
             "한글패치 설치 준비 필요", "대상 파일 ${missing}개가 없습니다. 게임에서 리소스를 모두 다운로드한 뒤 다시 시도해 주세요.",
             StatusIndicator.ERROR,
@@ -65,6 +68,7 @@ internal fun resolvePatchInstallationStatus(
         if (!error.isNullOrBlank()) {
             return PatchInstallationStatus("한글패치 확인 실패", error, StatusIndicator.ERROR)
         }
+        if (update != null) return awaitingGameUpdate(update)
         return unobservedPatchStatus(identity)
     }
     val observed = files.associateBy { it.path }
@@ -90,7 +94,8 @@ internal fun resolvePatchInstallationStatus(
     if (contents == PatchContents.ORIGINAL) {
         // Installation and restore history do not override the actual unpatched files.
         return PatchInstallationStatus(
-            "한글패치 미설치", "설치 버튼을 누르면 최신 한글패치 리소스를 적용합니다", StatusIndicator.NEUTRAL,
+            "한글패치 미설치", if (update != null) gameUpdatePatchDescription(update)
+                else "설치 버튼을 누르면 최신 한글패치 리소스를 적용합니다", StatusIndicator.NEUTRAL,
         )
     }
     if (contents == PatchContents.PATCHED) {
@@ -106,7 +111,8 @@ internal fun resolvePatchInstallationStatus(
         val newer = newerPatchRelease(manifest, latestRelease, releaseCandidates)
         if (newer != null) {
             return PatchInstallationStatus(
-                "한글패치 업데이트 필요", "설치됨 ${manifest.patchVersion} · 최신 ${newer.patchVersion}",
+                "한글패치 업데이트 필요", "설치됨 ${manifest.patchVersion} · 최신 ${newer.patchVersion}" +
+                    update?.let { "\n${gameUpdatePatchDescription(it)}" }.orEmpty(),
                 StatusIndicator.PENDING, manifest.patchVersion,
             )
         }
@@ -115,11 +121,18 @@ internal fun resolvePatchInstallationStatus(
             StatusIndicator.ERROR,
         )
     }
+    if (update != null && error.isNullOrBlank()) return awaitingGameUpdate(update)
     return PatchInstallationStatus(
         "한글패치 확인 필요", "파일이 원본 또는 확인된 한글패치와 일치하지 않습니다. 실행 로그를 확인해 주세요.",
         StatusIndicator.ERROR,
     )
 }
+
+private fun gameUpdatePatchDescription(update: GameUpdateRequirement): String =
+    "최신 한글패치를 설치하려면 게임을 ${update.requiredVersion}으로 업데이트해 주세요."
+
+private fun awaitingGameUpdate(update: GameUpdateRequirement): PatchInstallationStatus =
+    PatchInstallationStatus("한글패치 확인 대기", gameUpdatePatchDescription(update), StatusIndicator.NEUTRAL)
 
 private fun unobservedPatchStatus(identity: CatalogIdentity?): PatchInstallationStatus =
     if (identity?.historyStatus == "CORRUPT" || !identity?.historyError.isNullOrBlank()) {

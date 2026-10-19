@@ -41,9 +41,12 @@ internal fun selectPatchStatusObservation(
     load: (ReleaseEntry) -> PatchStatusObservation,
     onFailure: (ReleaseEntry, Exception) -> Unit = { _, _ -> },
 ): PatchStatusObservation {
-    if (primary.inspection.catalogMatches && patchContents(primary) == PatchContents.PATCHED) return primary
+    val primaryContents = if (primary.inspection.catalogMatches) patchContents(primary) else PatchContents.UNKNOWN
+    if (primaryContents == PatchContents.PATCHED) return primary
     val baseline = compatible ?: primary
-    if (baseline.inspection.catalogMatches && patchContents(baseline) != PatchContents.UNKNOWN) return baseline
+    val baselineContents = if (compatible == null) primaryContents
+        else if (compatible.inspection.catalogMatches) patchContents(compatible) else PatchContents.UNKNOWN
+    if (baselineContents != PatchContents.UNKNOWN) return baseline
     if (identity == null || identity.gameVersion.isBlank() || identity.catalogHash.isBlank()) return baseline
     val eligible = candidates.filter {
         it.route == primary.manifest.route && it.gameVersion == identity.gameVersion &&

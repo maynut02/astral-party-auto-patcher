@@ -191,7 +191,90 @@ class PatchInstallationStatusTest {
         assertEquals("한글패치 업데이트 필요", status.label)
         assertEquals(StatusIndicator.PENDING, status.indicator)
         assertEquals(manifest.patchVersion, status.installedPatchVersion)
+        assertTrue(status.description.contains("게임"))
+        assertTrue(status.description.contains("3.4.0"))
+        assertTrue(status.description.contains("업데이트"))
     }
+
+    @Test fun verifiedOlderOriginalsStayUninstalledWithGameUpdateGuidance() {
+        val latest = nextGameRelease()
+        val status = resolve(inspection = inspection(originals), latest = latest, candidates = listOf(latest, release()))
+        assertEquals("한글패치 미설치", status.label)
+        assertEquals(StatusIndicator.NEUTRAL, status.indicator)
+        assertNull(status.installedPatchVersion)
+        assertTrue(status.description.contains("게임"))
+        assertTrue(status.description.contains(latest.gameVersion))
+        assertTrue(status.description.contains("업데이트"))
+    }
+
+    @Test fun outdatedApkWithoutOldResourceObservationsWaitsWithoutClaimingInstallation() {
+        val latest = nextGameRelease()
+        for ((observed, expected) in listOf(
+            null to null,
+            null to manifest,
+            inspection().copy(files = emptyList()) to manifest,
+        )) {
+            val status = resolvePatchInstallationStatus(
+                identity(), observed, expected, manifest.gameVersion, latest, listOf(latest, release()),
+            )
+            assertAwaitingGameUpdate(status, latest)
+        }
+    }
+
+    @Test fun outdatedApkMissingOrUnknownFilesWaitForGameUpdateInsteadOfReportingFailure() {
+        val latest = nextGameRelease()
+        for (observed in listOf(
+            inspection(listOf(null, null, null)),
+            inspection(listOf(payloads[0], null, payloads[2])),
+            inspection(listOf("unrecognized old resource", payloads[1], payloads[2])),
+            inspection(listOf(originals[0], payloads[1], payloads[2])),
+        )) {
+            assertAwaitingGameUpdate(resolve(inspection = observed, latest = latest, candidates = listOf(latest, release())), latest)
+        }
+    }
+
+    @Test fun gameUpdateRequirementDoesNotHideReadAccessOrAmbiguousPathFailures() {
+        val latest = nextGameRelease()
+        val observed = inspection()
+        for (failed in listOf(
+            observed.copy(unreadable = 1),
+            observed.copy(ambiguous = 1),
+            observed.copy(files = observed.files.mapIndexed { index, file ->
+                if (index == 0) file.copy(state = "UNREADABLE", error = "EACCES") else file
+            }),
+            observed.copy(files = observed.files.mapIndexed { index, file ->
+                if (index == 0) file.copy(candidates = listOf(file.actualPath, "another-cache/${file.path}")) else file
+            }),
+        )) {
+            val status = resolve(inspection = failed, latest = latest, candidates = listOf(latest, release()))
+            assertEquals(StatusIndicator.ERROR, status.indicator)
+            assertNull(status.installedPatchVersion)
+        }
+    }
+
+    @Test fun gameUpdateRequirementDoesNotHideMetadataQueryFailures() {
+        val latest = nextGameRelease()
+        val status = resolvePatchInstallationStatus(
+            identity(), null, null, manifest.gameVersion, latest, listOf(latest, release()), error = "manifest 조회 실패",
+        )
+        assertEquals("한글패치 확인 실패", status.label)
+        assertEquals(StatusIndicator.ERROR, status.indicator)
+        assertTrue(status.description.contains("조회 실패"))
+    }
+
+    private fun assertAwaitingGameUpdate(status: PatchInstallationStatus, latest: ReleaseEntry) {
+        assertEquals("한글패치 확인 대기", status.label)
+        assertEquals(StatusIndicator.NEUTRAL, status.indicator)
+        assertNull(status.installedPatchVersion)
+        assertTrue(status.description.contains("게임"))
+        assertTrue(status.description.contains(latest.gameVersion))
+        assertTrue(status.description.contains("업데이트"))
+        assertFalse(status.description.contains("리소스를 모두 다운로드"))
+    }
+
+    private fun nextGameRelease() = release().copy(
+        gameVersion = "3.4.0", revision = "001", patchVersion = "v3.4.0_r001_p0", catalogHash = "d".repeat(32),
+    )
 
     @Test fun catalogAndApkMismatchAreErrorsEvenWithMatchingPayloadBytes() {
         for ((observed, gameVersion) in listOf(
